@@ -1,0 +1,55 @@
+# Global settings
+seed: 42                    # RNG seed for reproducibility
+episodes: 1                # number of paired (clean vs. attack) episodes
+
+# Universe / data
+assets: ["AAPL", "MSFT"]    # symbols must match CSV filenames under data/returns
+data:
+  returns_dir: "data/returns"  # path to CSVs (date,ret) or (date,close)
+  rf_daily: 0.0                # daily risk-free rate subtracted from realized returns
+
+# Retrieval & memory
+retrieval:
+  top_k: 8                       # evidence items retrieved from memory
+  recency_half_life_hours: 48    # placeholder (not wired in toy runner)
+memory:
+  deep_threshold: 0.75           # promotion threshold for 'deep' memory
+  decay: 0.98                    # multiplicative decay per time unit
+
+# Debate coordination & judge LLM
+coordination:
+  type: "debate"                 # debate | manager | contest (future)
+  judge:
+    llm: "hf"                    # none | mock | hf | llama_cpp
+    model_id: "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+    max_new_tokens: 96
+    temperature: 0.2
+    top_p: 0.9
+    dtype: "auto"                # auto | bfloat16 | float16
+    load_8bit: false
+    load_4bit: false
+
+# Alpha path and policy thresholds
+alpha_path:
+  enabled: true                  # documented intent (toy always computes alpha)
+  k: 3                           # number of factors (toy miner uses first)
+
+policy:
+  buy_thr: 0.10
+  sell_thr: -0.10
+
+# Risk gate (toy)
+risk:
+  stop_loss: 0.08                # placeholders for future logic
+  take_profit: 0.12
+
+# Attack toggles (only A3 partially wired in toy runner)
+attacks:
+  A1_social_news: {enabled: false, n_items: 4, stance: 1}
+  A2_tools:       {enabled: false}
+  A3_debate:      {enabled: false, overlap: 0.6, bull_bias: 0.2}
+  A4_policy:      {enabled: false}
+
+# Output
+logging:
+  out_dir: "runs"
