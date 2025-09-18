@@ -1,38 +1,63 @@
 # Global settings
-seed: 42                    # RNG seed for reproducibility
-episodes: 1                # number of paired (clean vs. attack) episodes
+seed: 42                     # RNG seed for reproducibility
+episodes: 1                  # number of episodes to run
 
 # Universe / data
-assets: ["AAPL", "MSFT"]    # symbols must match CSV filenames under data/returns
+assets: ["AAPL", "MSFT"]     # symbols must match CSV filenames under data/returns
 data:
-  returns_dir: "data/returns"  # path to CSVs (date,ret) or (date,close)
-  rf_daily: 0.0                # daily risk-free rate subtracted from realized returns
+  returns_dir: "data/returns"
+  rf_daily: 0.0
 
-# Retrieval & memory
+  # Enable any subset of offline sources
+  sources: ["news", "social", "fundamentals"]
+
+  offline:
+    # Directories for file-backed feeds
+    news_dir: "data/news"
+    social_dir: "data/social"
+    fundamentals_dir: "data/fundamentals"
+
+    # Parsing & selection knobs
+    dayfirst: false                 # set true if your files use dd/mm/yyyy
+    news_include_poison: "all"      # all | clean_only | poison_only
+
+    # Aggregation weights (contribute to momentum-style score)
+    news_weight: 1.0
+    social_weight: 1.0
+
+    # Per-episode retrieval limits
+    news_limit: 5
+    social_limit: 5
+
+# Retrieval & memory (placeholders in the toy runner)
 retrieval:
-  top_k: 8                       # evidence items retrieved from memory
-  recency_half_life_hours: 48    # placeholder (not wired in toy runner)
+  top_k: 8
+  recency_half_life_hours: 48
 memory:
-  deep_threshold: 0.75           # promotion threshold for 'deep' memory
-  decay: 0.98                    # multiplicative decay per time unit
+  deep_threshold: 0.75
+  decay: 0.98
 
 # Debate coordination & judge LLM
 coordination:
-  type: "debate"                 # debate | manager | contest (future)
+  type: "debate"                     # debate | manager | contest (future)
+  # Fallback criterion if prompts.yaml doesn't provide one
+  # You can use {symbol} and {horizon} in this template.
+  criterion: "Which argument better predicts {symbol} next-{horizon}-day return? Consider relevance and plausibility."
+
   judge:
-    llm: "hf"                    # none | mock | hf
-    model_id: "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+    llm: "hf"                        # none | mock | hf
+    model_id: "mistralai/Mistral-7B-Instruct-v0.3"
     max_new_tokens: 96
     temperature: 0.2
     top_p: 0.9
-    dtype: "auto"                # auto | bfloat16 | float16
+    dtype: "auto"                    # auto | bfloat16 | float16 | float32
     load_8bit: false
-    load_4bit: false
+    load_4bit: true                  # set true if you want 4-bit quantized loading (bitsandbytes)
 
 # Alpha path and policy thresholds
 alpha_path:
-  enabled: true                  # documented intent (toy always computes alpha)
-  k: 3                           # number of factors (toy miner uses first)
+  enabled: true
+  k: 3                               # (not used in the toy miner yet)
 
 policy:
   buy_thr: 0.10
@@ -40,10 +65,10 @@ policy:
 
 # Risk gate (toy)
 risk:
-  stop_loss: 0.08                # placeholders for future logic
+  stop_loss: 0.08
   take_profit: 0.12
 
-# Attack toggles (only A3 partially wired in toy runner)
+# Attack toggles (not wired in this minimal runner)
 attacks:
   A1_social_news: {enabled: false, n_items: 4, stance: 1}
   A2_tools:       {enabled: false}
