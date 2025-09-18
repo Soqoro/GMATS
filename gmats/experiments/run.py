@@ -4,7 +4,7 @@ import json
 import os
 import random
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Iterable
 
 import pandas as pd
 import yaml  # pip install pyyaml
@@ -21,38 +21,45 @@ from gmats.core.registry import COORDINATORS, ALPHAS, POLICIES, RISKS, REWARDS
 from gmats.env.backtest import Backtester
 from gmats.env.backtest_env import BacktestEnvironment
 from gmats.env.backtester_feed import BacktesterFeed
+from gmats.env.file_feeds import NewsFileFeed, SocialFileFeed, FundamentalsFileFeed
 
 
 # ----- Minimal defaults / fallbacks -----
 
 class NullCoordinator(Coordinator):
     """
-    Derives a simple stance from inbox:
-      s = [ +margin ] if bull_score > bear_score
-          [ -margin ] if bear_score > bull_score
-      margin = |bull_score - bear_score|
+    Aggregate all 'bull' and all 'bear' scores across the inbox:
+        s = [ +margin ] if sum(bull_scores) >= sum(bear_scores)
+            [ -margin ] otherwise
+        margin = |sum(bull) - sum(bear)|
     If no messages or no scores, falls back to neutral.
     """
-    def _score(self, msgs: List[Message], role: str) -> float:
-        for m in msgs:
+    def _sum_role(self, msgs: Iterable[Message], role: str) -> float:
+        total = 0.0
+        for m in msgs or []:
             pl = (m.get("payload") or {})
             if str(pl.get("role", "")).lower() == role:
                 try:
-                    return float(pl.get("score", 0.0))
+                    total += float(pl.get("score", 0.0))
                 except Exception:
-                    return 0.0
-        return 0.0
+                    continue
+        return float(total)
 
-    def coordinate(self, inbox):
+    def coordinate(self, inbox: Iterable[Message]) -> CoordinationResult:
         msgs = list(inbox) if inbox else []
-        bull = self._score(msgs, "bull")
-        bear = self._score(msgs, "bear")
+        bull = self._sum_role(msgs, "bull")
+        bear = self._sum_role(msgs, "bear")
         if bull == 0.0 and bear == 0.0:
             return CoordinationResult(s=[0.0], rho={"mode": "null", "winner": "none", "margin": 0.0}, log=msgs)
         winner = "bull" if bull >= bear else "bear"
         margin = abs(bull - bear)
         sign = +margin if winner == "bull" else -margin
-        rho = {"mode": "null-derived", "winner": winner, "margin": float(margin), "scores": {"bull": bull, "bear": bear}}
+        rho = {
+            "mode": "null-agg",
+            "winner": winner,
+            "margin": float(margin),
+            "scores": {"bull_sum": bull, "bear_sum": bear},
+        }
         return CoordinationResult(s=[sign], rho=rho, log=msgs)
 
 class SimpleAlpha(AlphaMiner):
@@ -235,8 +242,21 @@ def main():
     returns_dir = pick(args.returns_dir, data_cfg.get("returns_dir"), "data/returns")
     rf_daily = float(pick(args.rf_daily, data_cfg.get("rf_daily"), 0.0))
 
+    # Offline sources config (news/social/fundamentals)
+    sources = [str(s).lower() for s in (data_cfg.get("sources") or [])]
+    offline_cfg = data_cfg.get("offline", {}) or {}
+    news_dir = Path(offline_cfg.get("news_dir", "data/news"))
+    social_dir = Path(offline_cfg.get("social_dir", "data/social"))
+    fund_dir = Path(offline_cfg.get("fundamentals_dir", "data/fundamentals"))
+    dayfirst = bool(offline_cfg.get("dayfirst", False))
+    news_include_poison = str(offline_cfg.get("news_include_poison", "all"))
+    news_weight = float(offline_cfg.get("news_weight", 1.0))
+    social_weight = float(offline_cfg.get("social_weight", 1.0))
+    news_limit = int(offline_cfg.get("news_limit", 5))
+    social_limit = int(offline_cfg.get("social_limit", 5))
+
     episodes = int(pick(args.episodes, cfg.get("episodes"), 20))
-    horizon = int(pick(args.horizon, 1))
+    horizon = int(pick(args.horizon, cfg.get("horizon"), 1))
     asof = pick(args.asof, None)
 
     coord_name = pick(args.coordinator, (cfg.get("coordination", {}) or {}).get("type"), "null")
@@ -275,9 +295,9 @@ def main():
 
             if kind == "mock":
                 judge = MockLLM()
-            else:
+            elif kind == "hf":
                 judge = HFLLM(
-                    model_id=judge_cfg.get("model_id", "TinyLlama/TinyLlama-1.1B-Chat-v1.0"),
+                    model_id=judge_cfg.get("model_id", "mistralai/Mistral-7B-Instruct-v0.3"),
                     max_new_tokens=int(judge_cfg.get("max_new_tokens", 96)),
                     temperature=float(judge_cfg.get("temperature", 0.2)),
                     top_p=float(judge_cfg.get("top_p", 0.9)),
@@ -288,6 +308,8 @@ def main():
                     summarize_system=summarize_system,
                     judge_user_suffix=judge_user_suffix,
                 )
+            else:
+                judge = None  # explicit 'none' or unknown -> numeric fallback
         except Exception:
             judge = None  # fall back below
 
@@ -332,7 +354,7 @@ def main():
                     try:
                         crit = str(criterion_template).format(symbol=symbol, horizon=horizon)
                     except Exception:
-                        crit = str(criterion_template)  # use literal if formatting fails
+                        crit = str(criterion_template)  # literal if formatting fails
                 coord: Coordinator = DebateCoordinator(llm=judge, criterion=crit)  # type: ignore
             except Exception:
                 coord = COORDINATORS.get("null")
@@ -342,6 +364,11 @@ def main():
         # 𝓜 + 𝓓 (per-asset instances)
         memory: MemoryStoreProto = MemoryStore()
         data_feed: DataFeed = BacktesterFeed(bt, symbol)
+
+        # Optional offline feeds (per-asset)
+        news_feed = NewsFileFeed(Path(news_dir), default_symbol=symbol, dayfirst=dayfirst, include_poison=news_include_poison) if "news" in sources else None
+        social_feed = SocialFileFeed(Path(social_dir), default_symbol=symbol, dayfirst=dayfirst) if "social" in sources else None
+        fund_feed = FundamentalsFileFeed(Path(fund_dir), default_symbol=symbol, dayfirst=dayfirst) if "fundamentals" in sources else None
 
         xs = rolling_schedule(bt, symbol, asof, episodes, horizon)
         history: List[Dict[str, Any]] = []
@@ -354,27 +381,117 @@ def main():
             # 𝓓 observe → toy momentum score
             obs = data_feed.observe(x_t["asof"], {"limit": 5})
             rets = [it["ret"] for it in obs if "ret" in it]
-            m = (sum(rets) / len(rets)) if rets else 0.0
+            m_mom = (sum(rets) / len(rets)) if rets else 0.0
 
-            # E routing → 𝓛 inbox
-            inbox: List[Message] = [
+            context_str = ""
+            inbox: List[Message] = []
+
+            # Momentum analyst -> messages
+            inbox.extend([
                 {
-                    "id": f"bull:{symbol}:{ep}",
+                    "id": f"mom_bull:{symbol}:{ep}",
                     "sender": "analyst.momentum",
                     "t": "argument",
-                    "payload": {"role": "bull", "score": max(m, 0.0), "speech": ""},
+                    "payload": {"role": "bull", "score": max(m_mom, 0.0), "speech": "", "context": ""},
                     "schema": "gmats/argument@v1",
                     "prov": {"source": "momentum", "window": 5, "symbol": symbol},
                 },
                 {
-                    "id": f"bear:{symbol}:{ep}",
+                    "id": f"mom_bear:{symbol}:{ep}",
                     "sender": "analyst.momentum",
                     "t": "argument",
-                    "payload": {"role": "bear", "score": max(-m, 0.0), "speech": ""},
+                    "payload": {"role": "bear", "score": max(-m_mom, 0.0), "speech": "", "context": ""},
                     "schema": "gmats/argument@v1",
                     "prov": {"source": "momentum", "window": 5, "symbol": symbol},
                 },
-            ]
+            ])
+
+            # Offline news analyst
+            if news_feed is not None:
+                news_items = news_feed.observe(x_t["asof"], {"limit": news_limit, "symbol": symbol})
+                titles: List[str] = []
+                s_news_vals: List[float] = []
+                for it in news_items:
+                    title_or_text = (it.get("title") or it.get("text") or "").strip()
+                    if title_or_text:
+                        titles.append(title_or_text)
+                    score = it.get("score")
+                    if score is not None:
+                        try:
+                            s_news_vals.append(float(score))
+                        except Exception:
+                            pass
+                if titles:
+                    context_str += "News:\n- " + "\n- ".join(titles[:5]) + "\n"
+                if s_news_vals:
+                    s_news = news_weight * (sum(s_news_vals) / max(len(s_news_vals), 1))
+                    inbox.extend([
+                        {
+                            "id": f"news_bull:{symbol}:{ep}",
+                            "sender": "analyst.news_offline",
+                            "t": "argument",
+                            "payload": {"role": "bull", "score": max(s_news, 0.0), "speech": "", "context": context_str},
+                            "schema": "gmats/argument@v1",
+                            "prov": {"source": "offline.news", "n_items": len(news_items), "symbol": symbol},
+                        },
+                        {
+                            "id": f"news_bear:{symbol}:{ep}",
+                            "sender": "analyst.news_offline",
+                            "t": "argument",
+                            "payload": {"role": "bear", "score": max(-s_news, 0.0), "speech": "", "context": context_str},
+                            "schema": "gmats/argument@v1",
+                            "prov": {"source": "offline.news", "n_items": len(news_items), "symbol": symbol},
+                        },
+                    ])
+
+            # Offline social analyst
+            if social_feed is not None:
+                social_items = social_feed.observe(x_t["asof"], {"limit": social_limit, "symbol": symbol})
+                texts: List[str] = []
+                s_soc_vals: List[float] = []
+                for it in social_items:
+                    text = (it.get("text") or it.get("title") or "").strip()
+                    if text:
+                        texts.append(text)
+                    score = it.get("score")
+                    if score is not None:
+                        try:
+                            s_soc_vals.append(float(score))
+                        except Exception:
+                            pass
+                if texts:
+                    context_str += "Social:\n- " + "\n- ".join(texts[:5]) + "\n"
+                if s_soc_vals:
+                    s_soc = social_weight * (sum(s_soc_vals) / max(len(s_soc_vals), 1))
+                    inbox.extend([
+                        {
+                            "id": f"social_bull:{symbol}:{ep}",
+                            "sender": "analyst.social_offline",
+                            "t": "argument",
+                            "payload": {"role": "bull", "score": max(s_soc, 0.0), "speech": "", "context": context_str},
+                            "schema": "gmats/argument@v1",
+                            "prov": {"source": "offline.social", "n_items": len(social_items), "symbol": symbol},
+                        },
+                        {
+                            "id": f"social_bear:{symbol}:{ep}",
+                            "sender": "analyst.social_offline",
+                            "t": "argument",
+                            "payload": {"role": "bear", "score": max(-s_soc, 0.0), "speech": "", "context": context_str},
+                            "schema": "gmats/argument@v1",
+                            "prov": {"source": "offline.social", "n_items": len(social_items), "symbol": symbol},
+                        },
+                    ])
+
+            # Fundamentals (context only for now)
+            if fund_feed is not None:
+                fund_snap = fund_feed.observe(x_t["asof"], {"symbol": symbol})
+                if fund_snap:
+                    snap = fund_snap[-1].get("metrics", {})
+                    keys = list(snap.keys())[:6]
+                    sample = {k: snap.get(k) for k in keys}
+                    context_str += f"Fundamentals(sample): {sample}\n"
+
+            # If using debate coordinator, pass the context via payloads (already included above)
 
             # 𝓛
             coord_res: CoordinationResult = coord.coordinate(inbox=inbox)
@@ -413,8 +530,8 @@ def main():
             if args.debug:
                 winner = coord_res.rho.get("winner", "n/a")
                 margin = coord_res.rho.get("margin", 0.0)
-                print(f"[{symbol}] [ep {ep}] {x_t['asof']} m={m:+.5f} winner={winner} margin={margin:.4f} "
-                      f"a={a} a'={a_prime} r={r_t:.6f} cum={cum_pnl:.6f}")
+                print(f"[{symbol}] [ep {ep}] {x_t['asof']} "
+                      f"winner={winner} margin={margin:.4f} a={a} a'={a_prime} r={r_t:.6f} cum={cum_pnl:.6f}")
 
             x_t = x_next  # optional advance
 
