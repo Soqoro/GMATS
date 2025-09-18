@@ -5,11 +5,12 @@ LlamaCppLLM
 Local GGUF-backed LLM using llama-cpp-python. Point `model_path` to your .gguf.
 """
 
-from ..core.interfaces import LLM
-from llama_cpp import Llama
+from .base import Judge
+from llama_cpp import Llama  # type: ignore
 
-class LlamaCppLLM(LLM):
-    """llama.cpp-backed implementation of the LLM Protocol."""
+
+class LlamaCppLLM(Judge):
+    """llama.cpp-backed implementation of the Judge protocol."""
 
     def __init__(self, model_path: str, n_ctx: int = 4096, n_gpu_layers: int = 0):
         self.llm = Llama(model_path=model_path, n_ctx=n_ctx, n_gpu_layers=n_gpu_layers)

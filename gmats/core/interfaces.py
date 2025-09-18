@@ -1,160 +1,134 @@
 from __future__ import annotations
 """
-GMATS Interfaces
-================
-Protocols (PEP 544) and TypedDicts that define the pluggable contracts in GMATS.
+GMATS Core Interfaces aligned to the formal definition:
+
+GMATS = (V, E, D, T, M, L, Φ, Π, Λ, 𝓔 | 𝓤, Σ, 𝓑, 𝓡)
 """
 
-from typing import Protocol, List, Dict, Any, Optional, TypedDict, Literal
+from dataclasses import dataclass
+from typing import Any, Dict, Iterable, List, Optional, Protocol, Tuple, TypedDict, Union
 
-# ---------------------------------------------------------------------------
-# Common payload types
-# ---------------------------------------------------------------------------
+# ---------- Graph: Roles & Wiring (V, E) ----------
 
 class Message(TypedDict, total=False):
-    """Message for coordination; in debate we expect roles 'bull' and 'bear'."""
-    role: Literal["bull", "bear"]
-    speech: str
-    score: float
-    context: str
-
-class Stance(TypedDict):
-    """Coordinator output."""
-    winner: Literal["bull", "bear"]
-    margin: float
-
-class Decision(TypedDict):
-    """Policy decision."""
-    action: Literal["BUY", "HOLD", "SELL"]
-    margin: float
-
-class ExecutionResult(TypedDict, total=False):
-    """Trader result."""
-    action: str
-    status: Literal["submitted", "filled", "rejected", "error"]
-    info: str
-
-class MemoryItem(TypedDict, total=False):
-    """Memory item (minimal)."""
     id: str
-    text: str
-    deep: bool
-    ts: float
-    cred: float
-    imp: float
+    sender: str         # v \in V
+    recipient: str      # v \in V (optional; broadcast if omitted)
+    t: str              # message type
+    payload: Dict[str, Any]
+    schema: Union[str, Dict[str, Any]]
+    prov: Dict[str, Any]  # provenance (timestamps, sources, tools used, etc.)
 
+# ---------- Data (𝓓) ----------
 
-# ---------------------------------------------------------------------------
-# LLM protocol
-# ---------------------------------------------------------------------------
-
-class LLM(Protocol):
-    """Minimal interface for an LLM used by analysts/judges."""
-
-    def summarize(self, prompt: str) -> str:
-        """Compress evidence into a concise argument (≤ a few sentences)."""
+class DataFeed(Protocol):
+    """Point-in-time observable data with provenance."""
+    def observe(self, t: Any, q: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Return items with timestamp <= t and provenance attached."""
         ...
 
-    def choose(self, context: str, a: str, b: str, criterion: str = "Which is better?") -> str:
-        """Choose 'A' or 'B' given shared context and a criterion."""
-        ...
+# ---------- Tools (𝓣) ----------
 
+class Tool(Protocol):
+    name: str
+    schema_in: Dict[str, Any]
+    schema_out: Dict[str, Any]
+    def validate(self, q: Dict[str, Any]) -> None: ...
+    def __call__(self, q: Dict[str, Any]) -> Dict[str, Any]: ...
 
-# ---------------------------------------------------------------------------
-# Memory
-# ---------------------------------------------------------------------------
+# ---------- Memory (𝓜) ----------
 
-class Memory(Protocol):
-    """Persistent store for notes/summaries/signals with admission and retrieval."""
+class MemoryStore(Protocol):
+    def admit(self, item: Dict[str, Any]) -> bool: ...
+    def promote(self, key: str) -> None: ...
+    def decay(self, dt: float) -> None: ...
+    def retrieve(self, query: Dict[str, Any], k: int = 10) -> List[Dict[str, Any]]: ...
 
-    def admit(self, item: Dict[str, Any]) -> bool:
-        """Attempt to add an item; return True iff accepted."""
-        ...
+# ---------- Coordination / Judge (𝓛) ----------
 
-    def promote(self, item_id: str, score: float) -> None:
-        """Optionally promote an item (e.g., to long-term memory)."""
-        ...
-
-    def retrieve(self, query: Dict[str, Any], k: int) -> List[MemoryItem]:
-        """Return the top-k items relevant to the query."""
-        ...
-
-    def stats(self) -> Dict[str, float]:
-        """Return counters/ratios (admitted, promotions, size, etc.)."""
-        ...
-
-
-# ---------------------------------------------------------------------------
-# Coordinator / Aggregator
-# ---------------------------------------------------------------------------
+@dataclass
+class CoordinationResult:
+    s: List[float]                  # state vector in R^n
+    rho: Dict[str, Any]             # e.g., routing/weights/consensus meta
+    log: List[Message]              # audit log / rationale
 
 class Coordinator(Protocol):
-    """Resolve conflicting messages into a single stance."""
+    def coordinate(self, inbox: Iterable[Message]) -> CoordinationResult: ...
 
-    def aggregate(self, messages: List[Message]) -> Stance:
-        """Aggregate role messages into a stance with a winner and margin."""
-        ...
-
-
-# ---------------------------------------------------------------------------
-# Alpha Miner
-# ---------------------------------------------------------------------------
+# ---------- Alpha-miner (Φ) ----------
 
 class AlphaMiner(Protocol):
-    """Map heterogeneous evidence to factor vectors and a scalar score."""
+    def factors(self, data: DataFeed, memory: Optional[MemoryStore] = None) -> List[float]: ...
 
-    def factors(self, evidence: List[Dict[str, Any]]) -> List[float]:
-        """Produce a k-dimensional factor vector from evidence."""
-        ...
+# ---------- Policy (Π) ----------
 
-    def score(self, factors: List[float]) -> float:
-        """Map factors to a single scalar (e.g., weighted sum)."""
-        ...
-
-
-# ---------------------------------------------------------------------------
-# Policy / Optimizer (PM)
-# ---------------------------------------------------------------------------
+Action = str  # "BUY", "SELL", "HOLD"
+Weights = List[float]
 
 class Policy(Protocol):
-    """Translate scores/stance into discrete actions or weights."""
-
-    def decide(self, score: float) -> Decision:
-        """Return {'action': BUY|HOLD|SELL, 'margin': float}."""
+    def decide(
+        self,
+        s: List[float],
+        f: Optional[List[float]],
+        state_t: Dict[str, Any]
+    ) -> Union[List[Action], Weights]:
         ...
 
+# ---------- Constraints / Risk (Λ) ----------
 
-# ---------------------------------------------------------------------------
-# Risk / Constraints
-# ---------------------------------------------------------------------------
-
-class RiskGate(Protocol):
-    """Enforce risk, liquidity, and compliance constraints."""
-
-    def gate(self, stance: Stance) -> Dict[str, Any]:
-        """Return at least {'ok': bool}; may include overrides/notes."""
+class Constraints(Protocol):
+    def gate(
+        self,
+        a: Union[List[Action], Weights],
+        state_t: Dict[str, Any],
+        history: List[Dict[str, Any]],
+        budgets: Dict[str, Any]
+    ) -> Tuple[bool, Union[List[Action], Weights]]:
+        """Return (ok, possibly-shaped action a')."""
         ...
 
+# ---------- Environment (𝓔) ----------
 
-# ---------------------------------------------------------------------------
-# Trader / Execution
-# ---------------------------------------------------------------------------
-
-class Trader(Protocol):
-    """Submit actions to execution (sim/live)."""
-
-    def execute(self, action: str) -> ExecutionResult:
-        """Attempt to execute an action; return status/info."""
-        ...
-
-
-# ---------------------------------------------------------------------------
-# Environment / Backtester
-# ---------------------------------------------------------------------------
+@dataclass
+class Fills:
+    details: List[Dict[str, Any]]   # [{symbol, qty, price?, ret, pnl, ...}]
+    meta: Dict[str, Any]            # slippage, fees, etc.
 
 class Environment(Protocol):
-    """Convert actions into realized returns (evaluation loop)."""
-
-    def trade_return(self, symbol: str, asof_date: str, action: str, horizon: int = 1) -> float:
-        """Return realized (signed) return over the horizon for the action."""
+    def step(self, a_prime: Union[List[Action], Weights], x_t: Dict[str, Any]) -> Tuple[Fills, Dict[str, Any]]:
+        """Maps (a', x_t) -> (fills, x_{t+1})."""
         ...
+
+# ---------- Optional: Reward (𝓡), Update (𝓤), Schedule (Σ), Budgets (𝓑) ----------
+
+class Reward(Protocol):
+    def __call__(self, fills: Fills, x_next: Dict[str, Any]) -> float: ...
+
+class Updater(Protocol):
+    def update(
+        self,
+        components: Dict[str, Any],   # e.g., {"memory": M, "policy": Π, ...}
+        logs: List[Message],
+        reward: float
+    ) -> None: ...
+
+class Schedule(Protocol):
+    def next_tick(self, state: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Returns next orchestration state or None to stop."""
+        ...
+
+# Budgets 𝓑 can be a plain dict, but we offer a tiny helper dataclass
+@dataclass
+class Budgets:
+    tokens: Optional[int] = None
+    api_calls: Optional[int] = None
+    time_sec: Optional[float] = None
+    capital: Optional[float] = None
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {
+            "tokens": self.tokens,
+            "api_calls": self.api_calls,
+            "time_sec": self.time_sec,
+            "capital": self.capital,
+        }

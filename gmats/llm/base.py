@@ -2,8 +2,17 @@ from __future__ import annotations
 """
 LLM base helpers (optional)
 ===========================
-This module is optional; implementations can directly conform to
-gmats.core.interfaces.LLM. Kept here only if you want to centralize
-LLM utilities or shared mixins.
+Defines a light Judge protocol used by coordinators.
+
+Any class implementing:
+    - summarize(prompt: str) -> str
+    - choose(context: str, a: str, b: str, criterion: str = "...") -> str
+is considered a valid Judge.
 """
-# Intentionally empty to avoid duplicate Protocols.
+
+from typing import Protocol
+
+
+class Judge(Protocol):
+    def summarize(self, prompt: str) -> str: ...
+    def choose(self, context: str, a: str, b: str, criterion: str = "Which is better?") -> str: ...

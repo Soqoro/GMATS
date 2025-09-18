@@ -6,12 +6,13 @@ Uses `dtype=` (new API). Falls back to `torch_dtype=` for older Transformers.
 """
 
 from typing import Any
-import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM
-from ..core.interfaces import LLM
+import torch  # type: ignore
+from transformers import AutoTokenizer, AutoModelForCausalLM  # type: ignore
+from .base import Judge
+
 
 def _resolve_dtype(name: str) -> Any:
-    """Map YAML string -> torch dtype or 'auto'."""
+    """Map YAML/CLI string -> torch dtype or 'auto'."""
     n = (name or "auto").lower()
     if n in ("auto",):
         return "auto"
@@ -21,15 +22,22 @@ def _resolve_dtype(name: str) -> Any:
         return torch.float16
     if n in ("float32", "fp32"):
         return torch.float32
-    # default: auto
     return "auto"
 
-class HFLLM(LLM):
-    """Generic HuggingFace CausalLM wrapper implementing the LLM Protocol."""
 
-    def __init__(self, model_id: str, max_new_tokens: int = 96,
-                 temperature: float = 0.2, top_p: float = 0.9,
-                 dtype: str = "auto", load_8bit: bool = False, load_4bit: bool = False):
+class HFLLM(Judge):
+    """Generic HuggingFace CausalLM wrapper implementing the Judge protocol."""
+
+    def __init__(
+        self,
+        model_id: str,
+        max_new_tokens: int = 96,
+        temperature: float = 0.2,
+        top_p: float = 0.9,
+        dtype: str = "auto",
+        load_8bit: bool = False,
+        load_4bit: bool = False,
+    ):
         self.model_id = model_id
         self.max_new_tokens = int(max_new_tokens)
         self.temperature = float(temperature)
@@ -55,7 +63,7 @@ class HFLLM(LLM):
         except TypeError:
             # Older transformers: fall back to torch_dtype=
             kwargs.pop("dtype", None)
-            kwargs["torch_dtype"] = resolved  # deprecated in new versions, ok here
+            kwargs["torch_dtype"] = resolved
             self.model = AutoModelForCausalLM.from_pretrained(
                 model_id, device_map="auto", **kwargs
             )
@@ -64,15 +72,16 @@ class HFLLM(LLM):
 
         # Ensure we have a pad token (some chat models lack one)
         if self.tokenizer.pad_token_id is None:
-            # fall back to eos to avoid generate() warnings
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
     # ---- prompt helpers ----
     def _format(self, system: str, user: str):
         """Build a chat or instruction-formatted prompt."""
         if self.has_chat:
-            messages = [{"role": "system", "content": system},
-                        {"role": "user", "content": user}]
+            messages = [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ]
             text = self.tokenizer.apply_chat_template(
                 messages, tokenize=False, add_generation_prompt=True
             )
@@ -83,7 +92,6 @@ class HFLLM(LLM):
 
     def _gen(self, ids):
         """Run generation with configured decoding parameters."""
-        # Safe eos/pad ids
         eos_id = self.tokenizer.eos_token_id
         pad_id = self.tokenizer.pad_token_id or eos_id
         return self.model.generate(
@@ -101,17 +109,21 @@ class HFLLM(LLM):
         gen = out[0][ids["input_ids"].shape[1]:]
         return self.tokenizer.decode(gen, skip_special_tokens=True).strip()
 
-    # ---- LLM Protocol methods ----
+    # ---- Judge methods ----
     def summarize(self, prompt: str) -> str:
-        """Summarize evidence in ≤ ~2 sentences."""
-        ids = self._format("You are a concise financial analyst. Summarize in two sentences.", prompt)
+        ids = self._format(
+            "You are a concise financial analyst. Summarize in two sentences.",
+            prompt,
+        )
         with torch.no_grad():
             out = self._gen(ids)
         return self._decode_new(ids, out)
 
     def choose(self, context: str, a: str, b: str, criterion: str = "Which is better?") -> str:
-        """Return 'A' or 'B' selecting the better argument under the criterion."""
-        user = f"{criterion}\n\nCONTEXT:\n{context}\n\nA:\n{a}\n\nB:\n{b}\n\nAnswer with A or B."
+        user = (
+            f"{criterion}\n\nCONTEXT:\n{context}\n\nA:\n{a}\n\nB:\n{b}\n\n"
+            "Answer with A or B."
+        )
         ids = self._format("You are a fair debate judge. Reply 'A' or 'B' only.", user)
         with torch.no_grad():
             out = self._gen(ids)
