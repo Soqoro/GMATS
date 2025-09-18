@@ -11,7 +11,6 @@ Accepted CSV formats per symbol (filename = SYMBOL.csv):
 
 from pathlib import Path
 from typing import Dict
-import re
 import pandas as pd
 
 
@@ -44,8 +43,8 @@ class Backtester:
             # Fail fast if any unparseable
             bad = df["date"].isna()
             if bad.any():
-                sample_raw = df.loc[bad].index[:3]
-                sample_vals = [str(v) for v in df.loc[sample_raw, "date"]]
+                sample_idx = df.index[bad][:3]
+                sample_vals = [str(v) for v in df.loc[sample_idx, "date"]]
                 raise ValueError(
                     f"{f} has {bad.sum()} rows with unparseable dates. "
                     f"Ensure ISO (YYYY-MM-DD) or common slash/dash formats. Sample: {sample_vals}"
@@ -75,78 +74,38 @@ class Backtester:
         """
         Parse common date formats deterministically with explicit strptime formats
         to avoid pandas' dayfirst warnings.
-
-        Supported (auto-detected) formats:
-          - YYYY-MM-DD
-          - YYYY/MM/DD
-          - DD/MM/YYYY, MM/DD/YYYY
-          - DD-MM-YYYY, MM-DD-YYYY
-          - Fallback: generic parser (e.g., 'Jan 02 2024')
         """
         s = series.astype(str).str.strip()
 
         # Fast path: strict ISO YYYY-MM-DD
-        iso_mask = s.str.match(r"^\d{4}-\d{2}-\d{2}$")
-        if iso_mask.all():
-            dt = pd.to_datetime(s, format="%Y-%m-%d", errors="coerce")
-            return dt.dt.normalize()
+        iso = pd.to_datetime(s, format="%Y-%m-%d", errors="coerce")
+        if iso.notna().all():
+            return iso.dt.normalize()
 
-        # Detect separator
-        # Prefer slash or dash; ignore other punctuation.
-        has_slash = s.str.contains("/")
-        has_dash = s.str.contains("-")
+        # Try YYYY/MM/DD
+        ymd_slash = pd.to_datetime(s, format="%Y/%m/%d", errors="coerce")
+        if ymd_slash.notna().all():
+            return ymd_slash.dt.normalize()
 
-        # YYYY/MM/DD
-        if has_slash.any():
-            # If *all* look like YYYY/... and first token is 4-digit → year-first
-            parts = s.str.split("/", n=2, expand=True)
-            if parts.shape[1] == 3:
-                first_len4 = parts[0].str.fullmatch(r"\d{4}", na=False)
-                third_len4 = parts[2].str.fullmatch(r"\d{4}", na=False)
+        # Try DD/MM/YYYY then MM/DD/YYYY (fill-na strategy; no warnings)
+        dmy_slash = pd.to_datetime(s, format="%d/%m/%Y", errors="coerce")
+        if dmy_slash.notna().any():
+            mdy_slash = pd.to_datetime(s, format="%m/%d/%Y", errors="coerce")
+            out = dmy_slash.fillna(mdy_slash)
+            if out.notna().all():
+                return out.dt.normalize()
 
-                if first_len4.mean() > 0.9:
-                    fmt = "%Y/%m/%d"
-                    dt = pd.to_datetime(s, format=fmt, errors="coerce")
-                    if not dt.isna().all():
-                        return dt.dt.normalize()
+        # Try dash variants
+        ymd_dash = pd.to_datetime(s, format="%Y-%m-%d", errors="coerce")
+        if ymd_dash.notna().all():
+            return ymd_dash.dt.normalize()
 
-                # Decide DD/MM/YYYY vs MM/DD/YYYY by majority on first field
-                if third_len4.mean() > 0.9:
-                    first_num = pd.to_numeric(parts[0], errors="coerce")
-                    # If most first tokens are >12 → likely DD/MM/YYYY
-                    dayfirst = (first_num > 12).mean() > 0.5
-                    fmt = "%d/%m/%Y" if dayfirst else "%m/%d/%Y"
-                    dt = pd.to_datetime(s, format=fmt, errors="coerce")
-                    if dt.isna().any():
-                        # Try the opposite for any leftovers (no warnings in either case)
-                        alt_fmt = "%m/%d/%Y" if dayfirst else "%d/%m/%Y"
-                        dt2 = pd.to_datetime(s, format=alt_fmt, errors="coerce")
-                        dt = dt.fillna(dt2)
-                    return dt.dt.normalize()
-
-        # Dash variants
-        if has_dash.any():
-            parts = s.str.split("-", n=2, expand=True)
-            if parts.shape[1] == 3:
-                # YYYY-MM-DD
-                first_len4 = parts[0].str.fullmatch(r"\d{4}", na=False)
-                if first_len4.mean() > 0.9:
-                    dt = pd.to_datetime(s, format="%Y-%m-%d", errors="coerce")
-                    if not dt.isna().all():
-                        return dt.dt.normalize()
-
-                # Decide DD-MM-YYYY vs MM-DD-YYYY
-                third_len4 = parts[2].str.fullmatch(r"\d{4}", na=False)
-                if third_len4.mean() > 0.9:
-                    first_num = pd.to_numeric(parts[0], errors="coerce")
-                    dayfirst = (first_num > 12).mean() > 0.5
-                    fmt = "%d-%m-%Y" if dayfirst else "%m-%d-%Y"
-                    dt = pd.to_datetime(s, format=fmt, errors="coerce")
-                    if dt.isna().any():
-                        alt_fmt = "%m-%d-%Y" if dayfirst else "%d-%m-%Y"
-                        dt2 = pd.to_datetime(s, format=alt_fmt, errors="coerce")
-                        dt = dt.fillna(dt2)
-                    return dt.dt.normalize()
+        dmy_dash = pd.to_datetime(s, format="%d-%m-%Y", errors="coerce")
+        if dmy_dash.notna().any():
+            mdy_dash = pd.to_datetime(s, format="%m-%d-%Y", errors="coerce")
+            out = dmy_dash.fillna(mdy_dash)
+            if out.notna().all():
+                return out.dt.normalize()
 
         # Final fallback: let pandas guess (rare strings), then normalize
         dt = pd.to_datetime(s, errors="coerce")
