@@ -3,9 +3,15 @@ from __future__ import annotations
 HFLLM: Hugging Face backend (dtype-compatible)
 ==============================================
 Uses `dtype=` (new API). Falls back to `torch_dtype=` for older Transformers.
+
+New features:
+- Customizable system prompts via constructor:
+    judge_system: str | None
+    summarize_system: str | None
+- Optional judge_user_suffix appended to the user message in choose()
 """
 
-from typing import Any
+from typing import Any, Optional, Dict
 import torch  # type: ignore
 from transformers import AutoTokenizer, AutoModelForCausalLM  # type: ignore
 from .base import Judge
@@ -37,16 +43,36 @@ class HFLLM(Judge):
         dtype: str = "auto",
         load_8bit: bool = False,
         load_4bit: bool = False,
+        *,
+        judge_system: Optional[str] = None,
+        summarize_system: Optional[str] = None,
+        judge_user_suffix: Optional[str] = None,
     ):
+        """
+        Args:
+            model_id: HF repo id or local path.
+            max_new_tokens: generation budget for a single response.
+            temperature, top_p: decoding controls.
+            dtype: "auto" | "bfloat16" | "float16" | "float32".
+            load_8bit, load_4bit: quantized loading flags (bitsandbytes).
+            judge_system: override for the judge system prompt.
+            summarize_system: override for the summarizer system prompt.
+            judge_user_suffix: appended to the judge user message (e.g., "Answer with A or B.").
+        """
         self.model_id = model_id
         self.max_new_tokens = int(max_new_tokens)
         self.temperature = float(temperature)
         self.top_p = float(top_p)
 
+        # Prompts (defaults preserve prior behavior)
+        self.system_judge: str = judge_system or "You are a fair debate judge. Reply 'A' or 'B' only."
+        self.system_summarize: str = summarize_system or "You are a concise financial analyst. Summarize in two sentences."
+        self.judge_user_suffix: str = judge_user_suffix or "Answer with A or B."
+
         self.tokenizer = AutoTokenizer.from_pretrained(model_id, use_fast=True)
 
         # Build kwargs with quantization + dtype
-        kwargs: dict[str, Any] = {}
+        kwargs: Dict[str, Any] = {}
         if load_8bit:
             kwargs["load_in_8bit"] = True
         if load_4bit:
@@ -68,10 +94,12 @@ class HFLLM(Judge):
                 model_id, device_map="auto", **kwargs
             )
 
+        self.model.eval()
         self.has_chat = hasattr(self.tokenizer, "apply_chat_template")
 
         # Ensure we have a pad token (some chat models lack one)
         if self.tokenizer.pad_token_id is None:
+            # fall back to eos to avoid generate() warnings
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
     # ---- prompt helpers ----
@@ -111,10 +139,7 @@ class HFLLM(Judge):
 
     # ---- Judge methods ----
     def summarize(self, prompt: str) -> str:
-        ids = self._format(
-            "You are a concise financial analyst. Summarize in two sentences.",
-            prompt,
-        )
+        ids = self._format(self.system_summarize, prompt)
         with torch.no_grad():
             out = self._gen(ids)
         return self._decode_new(ids, out)
@@ -122,14 +147,18 @@ class HFLLM(Judge):
     def choose(self, context: str, a: str, b: str, criterion: str = "Which is better?") -> str:
         user = (
             f"{criterion}\n\nCONTEXT:\n{context}\n\nA:\n{a}\n\nB:\n{b}\n\n"
-            "Answer with A or B."
+            f"{self.judge_user_suffix}"
         )
-        ids = self._format("You are a fair debate judge. Reply 'A' or 'B' only.", user)
+        ids = self._format(self.system_judge, user)
         with torch.no_grad():
             out = self._gen(ids)
-        t = self._decode_new(ids, out).upper()
-        if "A" in t[:3] and "B" not in t[:3]:
-            return "A"
-        if "B" in t[:3] and "A" not in t[:3]:
-            return "B"
+        t = self._decode_new(ids, out).upper().strip()
+
+        # Robust parsing for "A" or "B"
+        # Look at the first few non-whitespace characters to decide.
+        for ch in t[:5]:
+            if ch == "A":
+                return "A"
+            if ch == "B":
+                return "B"
         return "A"  # conservative fallback

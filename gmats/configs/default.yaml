@@ -20,7 +20,7 @@ memory:
 coordination:
   type: "debate"                 # debate | manager | contest (future)
   judge:
-    llm: "hf"                    # none | mock | hf | llama_cpp
+    llm: "hf"                    # none | mock | hf
     model_id: "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
     max_new_tokens: 96
     temperature: 0.2
