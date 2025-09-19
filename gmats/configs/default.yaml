@@ -29,6 +29,11 @@ data:
     news_limit: 5
     social_limit: 5
 
+scoring:
+    enable_news: true
+    enable_social: true
+    neutral_band: 0.1
+    
 # Retrieval & memory (placeholders in the toy runner)
 retrieval:
   top_k: 8
