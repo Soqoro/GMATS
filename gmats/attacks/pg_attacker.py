@@ -2,19 +2,20 @@ from __future__ import annotations
 """
 Policy-Gradient Attacker (REINFORCE)
 ====================================
-Learns to perturb pre-policy signals (momentum/news/social scores) to *hurt* GMATS.
+Learns to perturb pre-policy signals (momentum/news/social) to *hurt* GMATS.
 
 - Action space: a_t = [Δ_mom, Δ_news, Δ_social] bounded via tanh * eps
 - Objective: maximize attack reward R_att = - r_env  (minimize PnL)
 - Regularizers:
     * Lipschitz (temporal smoothness):  λ_lip * ||a_t - a_{t-1}||^2
     * Generalization (weight decay):    λ_gen * sum ||θ||^2
+    * Entropy bonus (exploration):      β * H[π]
 
 Safe fallback: if torch isn't available, the attacker becomes a no-op.
 """
 
 from typing import Any, Dict, Optional
-import math  # NEW
+import math
 
 # ---- Safe pre-binding to avoid "possibly unbound" warnings ----
 torch: Any = None
@@ -27,7 +28,6 @@ try:
     import torch.optim as optim  # type: ignore
     TORCH_OK = True
 except Exception:
-    # keep the pre-bound stubs above; attacker will degrade to no-op
     TORCH_OK = False
 
 
@@ -42,13 +42,18 @@ class _NoOpAttacker:
     def update(self, feedback: Dict[str, Any]) -> None:
         return
 
+    # API parity helpers (no-ops)
+    def reset(self) -> None: ...
+    def state_dict(self) -> Dict[str, Any]: return {}
+    def load_state_dict(self, _: Dict[str, Any]) -> None: ...
+
 
 class PGAttacker:
     """
     Gaussian policy with REINFORCE + moving baseline.
 
-    Inputs (features): [m_mom, s_news, s_social, coord_margin]
-    Outputs: mean/log_std for 3 dims -> tanh -> scale by epsilons
+    Features (inputs): [m_mom, s_news, s_social, coord_margin]
+    Outputs: mean/log_std for 3 dims -> rsample -> tanh -> scale by eps
     """
 
     # NOTE: avoid torch types in annotations to keep file importable without torch
@@ -64,8 +69,10 @@ class PGAttacker:
         lambda_gen: float = 1e-4,
         entropy_coef: float = 1e-3,
         device: str = "auto",
+        grad_clip: float = 1.0,
+        seed: Optional[int] = None,
     ):
-        # always define attributes to satisfy static analyzers
+        # attrs always defined for static analyzers
         self._impl: Optional[_NoOpAttacker] = None
         self.device: Any = "cpu"
         self.eps: Any = None
@@ -75,18 +82,25 @@ class PGAttacker:
         self._last_action: Any = None
         self._curr_action: Any = None
         self._last_logprob: Any = None
-        self._last_log_std: Any = None        # NEW: keep log-std for entropy
+        self._last_log_std: Any = None
 
         self.lambda_lip = float(lambda_lip)
         self.lambda_gen = float(lambda_gen)
         self.entropy_coef = float(entropy_coef)
+        self.grad_clip = float(grad_clip)
 
         if not TORCH_OK:
             # degrade to no-op gracefully
             self._impl = _NoOpAttacker()
-            # keep shapes consistent for callers
             self._last_action = [0.0, 0.0, 0.0]
             return
+
+        # Seed (best-effort)
+        if seed is not None:
+            try:
+                torch.manual_seed(int(seed))
+            except Exception:
+                pass
 
         # Select device
         if device == "auto":
@@ -112,6 +126,7 @@ class PGAttacker:
         self._last_action = torch.zeros(3, device=self.device)
         self._curr_action = torch.zeros(3, device=self.device)
         self._last_logprob = None
+        self._last_log_std = None
 
     # --- helpers ---
     def _feat(self, obs: Dict[str, float]) -> Any:
@@ -126,25 +141,30 @@ class PGAttacker:
 
     # --- public API ---
     def propose(self, x_t: Dict[str, Any], obs: Dict[str, float]) -> Dict[str, float]:
+        """
+        Produce small deltas to upstream features. Must be called before `update()`.
+        Keeps logprob/log_std/current action for the policy-gradient step.
+        """
         if self._impl is not None:
             return self._impl.propose(x_t, obs)
 
         x = self._feat(obs)
         out = self.net(x)
         mean, log_std = out[:3], out[3:]
-        log_std = torch.clamp(log_std, -5.0, 2.0)          # numerical safety
+        # numeric safety on std
+        log_std = torch.clamp(log_std, -5.0, 2.0)
         std = torch.exp(log_std)
 
         dist = torch.distributions.Normal(mean, std)
-        raw_action = dist.rsample()                        # reparameterized sample
+        raw_action = dist.rsample()                 # reparameterized sample
         logprob = dist.log_prob(raw_action).sum()
 
-        action = torch.tanh(raw_action) * self.eps         # bound to [-eps, +eps]
+        action = torch.tanh(raw_action) * self.eps  # bound to [-eps, +eps]
 
-        # Keep for update() with gradient path intact
+        # Store for update() with gradient path intact
         self._last_logprob = logprob
-        self._curr_action = action                         # NOTE: no .detach() here
-        self._last_log_std = log_std                       # NEW
+        self._curr_action = action                  # NO .detach()
+        self._last_log_std = log_std
 
         return {
             "delta_mom": float(action[0].detach().cpu().item()),
@@ -153,6 +173,10 @@ class PGAttacker:
         }
 
     def update(self, feedback: Dict[str, Any]) -> None:
+        """
+        REINFORCE update on the last sampled action.
+        feedback: {"reward": R_att} where R_att = - r_env
+        """
         if self._impl is not None:
             self._impl.update(feedback)
             return
@@ -161,11 +185,11 @@ class PGAttacker:
 
         R_att = float(feedback.get("reward", 0.0))
 
-        # Lipschitz (temporal smoothness) penalty — now has gradients via _curr_action
+        # Lipschitz (temporal smoothness) with gradient via current action
         lip = torch.sum((self._curr_action - self._last_action) ** 2)
 
         # Manual L2 weight decay (generalization)
-        wd = torch.tensor(0.0, device=self.device)
+        wd = torch.zeros((), device=self.device)
         for p in self.net.parameters():
             wd = wd + p.pow(2).sum()
 
@@ -180,7 +204,7 @@ class PGAttacker:
             const = 0.5 * math.log(2.0 * math.pi * math.e)
             entropy = (const + self._last_log_std).sum()
         else:
-            entropy = torch.tensor(0.0, device=self.device)
+            entropy = torch.zeros((), device=self.device)
 
         loss = -(self._last_logprob * advantage) \
                + self.lambda_lip * lip \
@@ -190,7 +214,7 @@ class PGAttacker:
         self.opt.zero_grad(set_to_none=True)
         loss.backward()
         try:
-            torch.nn.utils.clip_grad_norm_(self.net.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(self.net.parameters(), self.grad_clip)
         except Exception:
             pass
         self.opt.step()
@@ -199,3 +223,48 @@ class PGAttacker:
         self._last_action = self._curr_action.detach()
         self._last_logprob = None
         self._last_log_std = None
+
+    # --- QoL helpers (optional) ---
+    def reset(self) -> None:
+        """Reset temporal state (e.g., between symbols or runs)."""
+        if self._impl is not None:
+            self._impl.reset()
+            return
+        self._last_action = torch.zeros(3, device=self.device)
+        self._curr_action = torch.zeros(3, device=self.device)
+        self._last_logprob = None
+        self._last_log_std = None
+        with torch.no_grad():
+            self.baseline.zero_()
+
+    def state_dict(self) -> Dict[str, Any]:
+        if self._impl is not None:
+            return self._impl.state_dict()
+        return {
+            "net": self.net.state_dict(),
+            "opt": self.opt.state_dict(),
+            "baseline": self.baseline.detach().cpu().numpy().tolist(),
+            "last_action": self._last_action.detach().cpu().numpy().tolist(),
+        }
+
+    def load_state_dict(self, state: Dict[str, Any]) -> None:
+        if self._impl is not None:
+            return
+        try:
+            self.net.load_state_dict(state.get("net", {}))
+            self.opt.load_state_dict(state.get("opt", {}))
+        except Exception:
+            pass
+        try:
+            b = state.get("baseline", None)
+            if b is not None:
+                with torch.no_grad():
+                    self.baseline[...] = torch.tensor(b, device=self.device)
+        except Exception:
+            pass
+        try:
+            la = state.get("last_action", None)
+            if la is not None:
+                self._last_action = torch.tensor(la, dtype=torch.float32, device=self.device)
+        except Exception:
+            pass

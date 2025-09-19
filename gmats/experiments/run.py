@@ -22,6 +22,9 @@ from gmats.env.backtester_feed import BacktesterFeed
 from gmats.env.file_feeds import NewsFileFeed, SocialFileFeed, FundamentalsFileFeed
 from gmats.attacks.pg_attacker import PGAttacker
 
+# Scored feeds + sentiment scorer
+from gmats.env.scored_feeds import ScoredNewsFeed, ScoredSocialFeed
+from gmats.tools.sentiment import SentimentScorer, SentimentConfig
 
 # ----- Minimal defaults / fallbacks -----
 
@@ -160,7 +163,7 @@ def parse_args() -> argparse.Namespace:
 def main():
     args = parse_args()
 
-    # Load main config (existing behavior)
+    # Load main config
     cfg = _load_yaml(
         getattr(args, "config", None),
         fallbacks=[
@@ -170,7 +173,7 @@ def main():
         ],
     )
 
-    # Load prompts (fills llm_prompts/coord_prompts)
+    # Load prompts
     prompts = _load_yaml(
         getattr(args, "prompts", None),
         fallbacks=[
@@ -181,8 +184,9 @@ def main():
     )
     coord_prompts = (prompts.get("coordinator") or {}) if isinstance(prompts, dict) else {}
     llm_prompts = (prompts.get("llm") or {}) if isinstance(prompts, dict) else {}
+    scoring_prompts = (prompts.get("scoring") or {}) if isinstance(prompts, dict) else {}
 
-    # Load attacker config (separate file, with sensible fallbacks)
+    # Attacker config (separate file or fallback to cfg.attacks)
     attacker_cfg = _load_yaml(
         args.attacker,
         fallbacks=[
@@ -191,10 +195,8 @@ def main():
             _repo_root() / "gmats" / "configs" / "attacker.yaml",
         ],
     )
-    # Backward-compat: if separate file missing, fall back to attacks block in default.yaml
     if not attacker_cfg and isinstance(cfg.get("attacks"), dict):
         attacker_cfg = dict(cfg.get("attacks") or {})
-
     attacks_enabled = bool(attacker_cfg.get("enabled", False))
     attack_type = str(attacker_cfg.get("type", "pg")).lower()
     pg_cfg = (attacker_cfg.get("pg") or {})
@@ -209,6 +211,7 @@ def main():
     data_cfg = cfg.get("data", {}) or {}
     returns_dir = pick(args.returns_dir, data_cfg.get("returns_dir"), "data/returns")
     rf_daily = float(pick(args.rf_daily, data_cfg.get("rf_daily"), 0.0))
+
     # Offline sources config (news/social/fundamentals)
     sources = [str(s).lower() for s in (data_cfg.get("sources") or [])]
     offline_cfg = data_cfg.get("offline", {}) or {}
@@ -222,6 +225,14 @@ def main():
     news_limit = int(offline_cfg.get("news_limit", 5))
     social_limit = int(offline_cfg.get("social_limit", 5))
 
+    # Scoring config
+    scoring_cfg = (data_cfg.get("scoring") or {})
+    score_news_enabled = bool(scoring_cfg.get("enable_news", False))
+    score_social_enabled = bool(scoring_cfg.get("enable_social", False))
+    neutral_band = float(scoring_cfg.get("neutral_band", 0.0))
+    model_override = (scoring_cfg.get("model_override") or {})
+
+    # Episodes / horizon / asof
     episodes = int(pick(args.episodes, cfg.get("episodes"), 20))
     horizon = int(pick(args.horizon, cfg.get("horizon"), 1))
     asof = pick(args.asof, None)
@@ -234,6 +245,42 @@ def main():
     yaml_policy = cfg.get("policy", {}) or {}
     use_yaml_thresholds = ("buy_thr" in yaml_policy) or ("sell_thr" in yaml_policy)
     risk_name = args.risk
+
+    # Output dir (also used for scorer cache)
+    out_dir = Path((cfg.get("logging", {}) or {}).get("out_dir", "runs"))
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Build a shared SentimentScorer (if any scoring is enabled)
+    judge_cfg = ((cfg.get("coordination", {}) or {}).get("judge", {}) or {})
+    scorer = None
+    if score_news_enabled or score_social_enabled:
+        model_id = model_override.get("model_id", judge_cfg.get("model_id", "mistralai/Mistral-7B-Instruct-v0.3"))
+        dtype = model_override.get("dtype", judge_cfg.get("dtype", "auto"))
+        load_8bit = bool(model_override.get("load_8bit", judge_cfg.get("load_8bit", False)))
+        load_4bit = bool(model_override.get("load_4bit", judge_cfg.get("load_4bit", False)))
+        max_new_tokens = int(model_override.get("max_new_tokens", judge_cfg.get("max_new_tokens", 48)))
+        temperature = float(model_override.get("temperature", judge_cfg.get("temperature", 0.0)))
+        top_p = float(model_override.get("top_p", judge_cfg.get("top_p", 0.9)))
+
+        score_system = scoring_prompts.get("system")
+        score_user_template = scoring_prompts.get("user_template")
+
+        cache_path = out_dir / "cache" / "sentiment_cache.jsonl"
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+
+        scorer = SentimentScorer(SentimentConfig(
+            model_id=model_id,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            dtype=dtype,
+            load_8bit=load_8bit,
+            load_4bit=load_4bit,
+            system=score_system,
+            user_template=score_user_template,
+            neutral_band=neutral_band,
+            cache_path=cache_path,
+        ))
 
     # 𝓔
     bt = Backtester(returns_dir, rf_daily=rf_daily)
@@ -256,8 +303,8 @@ def main():
         try:
             from gmats.llm.mock import MockLLM
             from gmats.llm.hf_generic import HFLLM
-            judge_cfg = ((cfg.get("coordination", {}) or {}).get("judge", {}) or {})
-            kind = (judge_cfg.get("llm") or "none").lower()
+            jcfg = ((cfg.get("coordination", {}) or {}).get("judge", {}) or {})
+            kind = (jcfg.get("llm") or "none").lower()
             judge_system = llm_prompts.get("judge_system")
             summarize_system = llm_prompts.get("summarize_system")
             judge_user_suffix = llm_prompts.get("judge_user_suffix")
@@ -266,13 +313,13 @@ def main():
                 judge = MockLLM()
             elif kind == "hf":
                 judge = HFLLM(
-                    model_id=judge_cfg.get("model_id", "mistralai/Mistral-7B-Instruct-v0.3"),
-                    max_new_tokens=int(judge_cfg.get("max_new_tokens", 96)),
-                    temperature=float(judge_cfg.get("temperature", 0.2)),
-                    top_p=float(judge_cfg.get("top_p", 0.9)),
-                    dtype=str(judge_cfg.get("dtype", "auto")),
-                    load_8bit=bool(judge_cfg.get("load_8bit", False)),
-                    load_4bit=bool(judge_cfg.get("load_4bit", False)),
+                    model_id=jcfg.get("model_id", "mistralai/Mistral-7B-Instruct-v0.3"),
+                    max_new_tokens=int(jcfg.get("max_new_tokens", 96)),
+                    temperature=float(jcfg.get("temperature", 0.2)),
+                    top_p=float(jcfg.get("top_p", 0.9)),
+                    dtype=str(jcfg.get("dtype", "auto")),
+                    load_8bit=bool(jcfg.get("load_8bit", False)),
+                    load_4bit=bool(jcfg.get("load_4bit", False)),
                     judge_system=judge_system,
                     summarize_system=summarize_system,
                     judge_user_suffix=judge_user_suffix,
@@ -304,10 +351,6 @@ def main():
 
     reward_fn: Reward = REWARDS.get(reward_name)
 
-    # Output dir
-    out_dir = Path((cfg.get("logging", {}) or {}).get("out_dir", "runs"))
-    out_dir.mkdir(parents=True, exist_ok=True)
-
     # ---- Run per symbol ----
     for symbol in symbols:
         # Coordinator per symbol
@@ -332,9 +375,25 @@ def main():
         memory: MemoryStoreProto = MemoryStore()
         data_feed: DataFeed = BacktesterFeed(bt, symbol)
 
-        # Offline feeds (optional)
-        news_feed = NewsFileFeed(news_dir, default_symbol=symbol, dayfirst=dayfirst, include_poison=news_include_poison) if "news" in sources else None
-        social_feed = SocialFileFeed(social_dir, default_symbol=symbol, dayfirst=dayfirst) if "social" in sources else None
+        # Offline feeds (optional), with LLM scoring if enabled
+        if "news" in sources:
+            if scorer is not None and score_news_enabled:
+                news_feed = ScoredNewsFeed(news_dir, default_symbol=symbol, dayfirst=dayfirst,
+                                           include_poison=news_include_poison, scorer=scorer)
+            else:
+                news_feed = NewsFileFeed(news_dir, default_symbol=symbol, dayfirst=dayfirst,
+                                         include_poison=news_include_poison)
+        else:
+            news_feed = None
+
+        if "social" in sources:
+            if scorer is not None and score_social_enabled:
+                social_feed = ScoredSocialFeed(social_dir, default_symbol=symbol, dayfirst=dayfirst, scorer=scorer)
+            else:
+                social_feed = SocialFileFeed(social_dir, default_symbol=symbol, dayfirst=dayfirst)
+        else:
+            social_feed = None
+
         fund_feed = FundamentalsFileFeed(fund_dir, default_symbol=symbol, dayfirst=dayfirst) if "fundamentals" in sources else None
 
         # Per-asset attacker
@@ -428,7 +487,6 @@ def main():
                 }
                 deltas = attacker.propose(x_t, obs_feats)
                 m_pert = float(m_mom) + float(deltas.get("delta_mom", 0.0))
-                # Optional: could perturb s_news/s_soc similarly if you later use them in policy
             else:
                 deltas = {"delta_mom": 0.0, "delta_news": 0.0, "delta_social": 0.0}
 
@@ -502,6 +560,7 @@ def main():
                 print(f"[{symbol}] ep={ep} asof={x_t['asof']} m={m_mom:+.5f} m_pert={m_pert:+.5f} "
                       f"winner={winner} margin={margin:+.4f} a={a} a'={a_prime} r={r_t:+.6f} cum={cum_pnl:+.6f}")
 
+        # Write per-symbol report
         out_file = out_dir / f"report_{symbol}.json"
         out_file.write_text(json.dumps({"symbol": symbol, "episodes": results}, indent=2))
         print(f"Wrote → {out_file}")

@@ -6,3 +6,15 @@ llm:
   judge_system: "You are a fair, skeptical debate judge. Reply 'A' or 'B' only."
   summarize_system: "You are a concise financial analyst. Summarize in two sentences."
   judge_user_suffix: "Answer with A or B." 
+
+scoring:
+  system: >
+    You are a financial sentiment rater. Output a SINGLE number in [-1, 1]
+    reflecting near-term return sentiment for the mentioned company. No words,
+    no symbols — just the number.
+
+  user_template: |
+    Text about {symbol}:
+    {text}
+
+    Return one number in [-1, 1].
