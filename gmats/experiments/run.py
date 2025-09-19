@@ -1,13 +1,11 @@
 from __future__ import annotations
-import argparse
-import json
 import os
-import random
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Iterable
-
+import json
+import argparse
 import pandas as pd
 import yaml  # pip install pyyaml
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Iterable
 
 from gmats.core.interfaces import (
     Budgets, CoordinationResult, Fills,
@@ -22,6 +20,7 @@ from gmats.env.backtest import Backtester
 from gmats.env.backtest_env import BacktestEnvironment
 from gmats.env.backtester_feed import BacktesterFeed
 from gmats.env.file_feeds import NewsFileFeed, SocialFileFeed, FundamentalsFileFeed
+from gmats.attacks.pg_attacker import PGAttacker
 
 
 # ----- Minimal defaults / fallbacks -----
@@ -42,7 +41,7 @@ class NullCoordinator(Coordinator):
                 try:
                     total += float(pl.get("score", 0.0))
                 except Exception:
-                    continue
+                    pass
         return float(total)
 
     def coordinate(self, inbox: Iterable[Message]) -> CoordinationResult:
@@ -104,85 +103,33 @@ except Exception:
 
 # ----- Config & prompts loading / merge -----
 
-def load_yaml(path: Optional[str]) -> Dict[str, Any]:
-    """
-    Auto-discover config in these locations (first hit wins) when --config is not provided:
-      ./default.yaml
-      ./configs/default.yaml
-      ./gmats/configs/default.yaml
-      <repo>/gmats/configs/default.yaml (relative to this file)
-    """
-    candidates: List[Path] = []
-    if path:
-        candidates = [Path(path)]
-    else:
-        cwd = Path.cwd()
-        candidates.extend([
-            cwd / "default.yaml",
-            cwd / "configs" / "default.yaml",
-            cwd / "gmats" / "configs" / "default.yaml",
-        ])
-        here = Path(__file__).resolve()
-        candidates.append(here.parent.parent / "configs" / "default.yaml")
-
-    for p in candidates:
-        if p.exists():
-            with p.open("r", encoding="utf-8") as f:
+def _load_yaml(path: Optional[str], *, fallbacks: Optional[List[Path]] = None) -> Dict[str, Any]:
+    if path and os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            return yaml.safe_load(f) or {}
+    for c in (fallbacks or []):
+        if c.exists():
+            with open(c, "r", encoding="utf-8") as f:
                 return yaml.safe_load(f) or {}
     return {}
 
-def load_prompts(path: Optional[str]) -> Dict[str, Any]:
-    """
-    Auto-discover prompts in these locations (first hit wins) when --prompts is not provided:
-      ./prompts.yaml
-      ./configs/prompts.yaml
-      ./gmats/configs/prompts.yaml
-      <repo>/gmats/configs/prompts.yaml (relative to this file)
-    """
-    candidates: List[Path] = []
-    if path:
-        candidates = [Path(path)]
-    else:
-        cwd = Path.cwd()
-        candidates.extend([
-            cwd / "prompts.yaml",
-            cwd / "configs" / "prompts.yaml",
-            cwd / "gmats" / "configs" / "prompts.yaml",
-        ])
-        here = Path(__file__).resolve()
-        candidates.append(here.parent.parent / "configs" / "prompts.yaml")
-
-    for p in candidates:
-        if p.exists():
-            with p.open("r", encoding="utf-8") as f:
-                return yaml.safe_load(f) or {}
-    return {}
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[2]
 
 def pick(val: Optional[Any], *fallbacks: Any) -> Any:
-    for v in (val, *fallbacks):
-        if v is not None:
-            return v
+    for x in (val, *fallbacks):
+        if x is not None:
+            return x
     return None
 
-
-# ----- Schedule -----
-
-def rolling_schedule(
-    bt: Backtester,
-    symbol: str,
-    start_asof: Optional[str],
-    episodes: int,
-    horizon: int = 1
-) -> List[Dict[str, Any]]:
-    """
-    Produce orchestration states using *positional* start index via searchsorted.
-    """
-    df = bt.data.get(symbol.upper())
-    if df is None or df.empty:
+def rolling_schedule(bt, symbol: str, start_asof: Optional[str], episodes: int, horizon: int = 1) -> List[Dict[str, Any]]:
+    df = (bt.data or {}).get(symbol.upper())
+    if df is None or len(df) == 0:
         return []
     if start_asof:
         start = pd.to_datetime(start_asof).normalize()
-        start_pos = int(pd.Series(df["date"]).searchsorted(start, side="left"))
+        mask = (df["date"] >= start)
+        start_pos = int(mask.to_numpy().argmax()) if mask.any() else 0
     else:
         start_pos = 0
     xs = []
@@ -191,57 +138,77 @@ def rolling_schedule(
         xs.append({"symbol": symbol.upper(), "asof": df["date"].iloc[i].strftime("%Y-%m-%d"), "horizon": horizon})
     return xs
 
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser()
+    p.add_argument("--config", type=str, default=None, help="Path to YAML config (auto-discovery enabled)")
+    p.add_argument("--prompts", type=str, default=None, help="Path to prompts.yaml (auto-discovery enabled)")
+    p.add_argument("--returns_dir", type=str, default=None)
+    p.add_argument("--symbol", type=str, default=None, help="If omitted, iterate all YAML assets")
+    p.add_argument("--episodes", type=int, default=None)
+    p.add_argument("--horizon", type=int, default=None)
+    p.add_argument("--asof", type=str, default=None)
+    p.add_argument("--rf_daily", type=float, default=None)
+    p.add_argument("--coordinator", type=str, default=None)
+    p.add_argument("--alpha", type=str, default=None)
+    p.add_argument("--policy", type=str, default=None)
+    p.add_argument("--risk", type=str, default=None)
+    p.add_argument("--reward", type=str, default=None)
+    p.add_argument("--attacker", type=str, default=None, help="Path to attacker.yaml (optional)")
+    p.add_argument("--debug", action="store_true")
+    return p.parse_args()
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--config", type=str, default=None, help="Path to YAML config (auto-discovery enabled)")
-    ap.add_argument("--prompts", type=str, default=None, help="Path to prompts.yaml (auto-discovery enabled)")
-    ap.add_argument("--returns_dir", type=str, default=None)
-    ap.add_argument("--symbol", type=str, default=None, help="If omitted, iterate all YAML assets")
-    ap.add_argument("--episodes", type=int, default=None)
-    ap.add_argument("--horizon", type=int, default=None)
-    ap.add_argument("--asof", type=str, default=None)
-    ap.add_argument("--rf_daily", type=float, default=None)
-    ap.add_argument("--coordinator", type=str, default=None)
-    ap.add_argument("--alpha", type=str, default=None)
-    ap.add_argument("--policy", type=str, default=None)
-    ap.add_argument("--risk", type=str, default=None)
-    ap.add_argument("--reward", type=str, default=None)
-    ap.add_argument("--debug", action="store_true")
-    args = ap.parse_args()
+    args = parse_args()
 
-    cfg = load_yaml(args.config)
-    prompts = load_prompts(args.prompts)
-    coord_prompts = (prompts.get("coordinator") or {})
-    llm_prompts = (prompts.get("llm") or {})
+    # Load main config (existing behavior)
+    cfg = _load_yaml(
+        getattr(args, "config", None),
+        fallbacks=[
+            Path.cwd() / "default.yaml",
+            Path.cwd() / "configs" / "default.yaml",
+            _repo_root() / "gmats" / "configs" / "default.yaml",
+        ],
+    )
 
-    # Seed (best-effort)
-    try:
-        seed = int(cfg.get("seed", 0))
-        if seed:
-            random.seed(seed)
-            try:
-                import numpy as np  # type: ignore
-                np.random.seed(seed)
-            except Exception:
-                pass
-            try:
-                import torch  # type: ignore
-                torch.manual_seed(seed)
-            except Exception:
-                pass
-    except Exception:
-        pass
+    # Load prompts (fills llm_prompts/coord_prompts)
+    prompts = _load_yaml(
+        getattr(args, "prompts", None),
+        fallbacks=[
+            Path.cwd() / "prompts.yaml",
+            Path.cwd() / "configs" / "prompts.yaml",
+            _repo_root() / "gmats" / "configs" / "prompts.yaml",
+        ],
+    )
+    coord_prompts = (prompts.get("coordinator") or {}) if isinstance(prompts, dict) else {}
+    llm_prompts = (prompts.get("llm") or {}) if isinstance(prompts, dict) else {}
+
+    # Load attacker config (separate file, with sensible fallbacks)
+    attacker_cfg = _load_yaml(
+        args.attacker,
+        fallbacks=[
+            Path.cwd() / "attacker.yaml",
+            Path.cwd() / "configs" / "attacker.yaml",
+            _repo_root() / "gmats" / "configs" / "attacker.yaml",
+        ],
+    )
+    # Backward-compat: if separate file missing, fall back to attacks block in default.yaml
+    if not attacker_cfg and isinstance(cfg.get("attacks"), dict):
+        attacker_cfg = dict(cfg.get("attacks") or {})
+
+    attacks_enabled = bool(attacker_cfg.get("enabled", False))
+    attack_type = str(attacker_cfg.get("type", "pg")).lower()
+    pg_cfg = (attacker_cfg.get("pg") or {})
+    eps_cfg = (pg_cfg.get("eps") or {})
+    lam_cfg = (pg_cfg.get("lambda") or {})
 
     # --- Pull from YAML with CLI overrides ---
     assets = cfg.get("assets") or []
-    symbols: List[str] = [pick(args.symbol, None)].copy() if args.symbol else [s for s in assets] or ["AAPL"]
+    symbols: List[str] = [args.symbol] if args.symbol else (assets or ["AAPL"])
     symbols = [str(s).upper() for s in symbols]
 
     data_cfg = cfg.get("data", {}) or {}
     returns_dir = pick(args.returns_dir, data_cfg.get("returns_dir"), "data/returns")
     rf_daily = float(pick(args.rf_daily, data_cfg.get("rf_daily"), 0.0))
-
     # Offline sources config (news/social/fundamentals)
     sources = [str(s).lower() for s in (data_cfg.get("sources") or [])]
     offline_cfg = data_cfg.get("offline", {}) or {}
@@ -272,27 +239,29 @@ def main():
     bt = Backtester(returns_dir, rf_daily=rf_daily)
     env: Environment = BacktestEnvironment(bt)
 
-    # Build judge (once), then instantiate the coordinator per symbol with a formatted criterion
+    # Filter symbols by available data
+    available = set((bt.data or {}).keys())
+    missing = [s for s in symbols if s not in available]
+    if missing:
+        print(f"Warning: missing returns data for {missing}. They will be skipped.")
+    symbols = [s for s in symbols if s in available]
+    if not symbols:
+        print("No valid symbols to run.")
+        return
+
+    # Build judge (once) and criterion template
     judge = None
     criterion_template = None
-
-    # If using debate, best-effort load judge + template
     if coord_name == "debate" and DEBATE_AVAILABLE:
         try:
             from gmats.llm.mock import MockLLM
             from gmats.llm.hf_generic import HFLLM
-
             judge_cfg = ((cfg.get("coordination", {}) or {}).get("judge", {}) or {})
             kind = (judge_cfg.get("llm") or "none").lower()
-
-            # Prompt overrides
             judge_system = llm_prompts.get("judge_system")
             summarize_system = llm_prompts.get("summarize_system")
             judge_user_suffix = llm_prompts.get("judge_user_suffix")
-
-            # Template: prompts.yaml wins over default.yaml if present
             criterion_template = coord_prompts.get("criterion") or (cfg.get("coordination", {}) or {}).get("criterion")
-
             if kind == "mock":
                 judge = MockLLM()
             elif kind == "hf":
@@ -308,15 +277,12 @@ def main():
                     summarize_system=summarize_system,
                     judge_user_suffix=judge_user_suffix,
                 )
-            else:
-                judge = None  # explicit 'none' or unknown -> numeric fallback
         except Exception:
-            judge = None  # fall back below
+            judge = None
 
-    # Alpha
+    # Alpha / Policy / Risk / Reward
     alpha: AlphaMiner = ALPHAS.get(alpha_name)
 
-    # Policy
     if policy_name is not None:
         policy: Policy = POLICIES.get(policy_name)
     elif use_yaml_thresholds:
@@ -327,7 +293,6 @@ def main():
     else:
         policy = POLICIES.get("threshold")
 
-    # Risk
     if risk_name is not None:
         risk: Constraints = RISKS.get(risk_name)
     else:
@@ -345,30 +310,47 @@ def main():
 
     # ---- Run per symbol ----
     for symbol in symbols:
-        # Coordinator per symbol: format criterion (if template given)
+        # Coordinator per symbol
         if coord_name == "debate" and DEBATE_AVAILABLE:
             try:
-                # Note: if criterion_template is None, DebateCoordinator will use its default
                 crit = None
                 if criterion_template:
                     try:
                         crit = str(criterion_template).format(symbol=symbol, horizon=horizon)
                     except Exception:
-                        crit = str(criterion_template)  # literal if formatting fails
+                        crit = str(criterion_template)
                 coord: Coordinator = DebateCoordinator(llm=judge, criterion=crit)  # type: ignore
             except Exception:
                 coord = COORDINATORS.get("null")
         else:
-            coord: Coordinator = COORDINATORS.get(coord_name) if coord_name in COORDINATORS.list() else COORDINATORS.get("null")
+            try:
+                coord = COORDINATORS.get(coord_name)
+            except Exception:
+                coord = COORDINATORS.get("null")
 
         # 𝓜 + 𝓓 (per-asset instances)
         memory: MemoryStoreProto = MemoryStore()
         data_feed: DataFeed = BacktesterFeed(bt, symbol)
 
-        # Optional offline feeds (per-asset)
-        news_feed = NewsFileFeed(Path(news_dir), default_symbol=symbol, dayfirst=dayfirst, include_poison=news_include_poison) if "news" in sources else None
-        social_feed = SocialFileFeed(Path(social_dir), default_symbol=symbol, dayfirst=dayfirst) if "social" in sources else None
-        fund_feed = FundamentalsFileFeed(Path(fund_dir), default_symbol=symbol, dayfirst=dayfirst) if "fundamentals" in sources else None
+        # Offline feeds (optional)
+        news_feed = NewsFileFeed(news_dir, default_symbol=symbol, dayfirst=dayfirst, include_poison=news_include_poison) if "news" in sources else None
+        social_feed = SocialFileFeed(social_dir, default_symbol=symbol, dayfirst=dayfirst) if "social" in sources else None
+        fund_feed = FundamentalsFileFeed(fund_dir, default_symbol=symbol, dayfirst=dayfirst) if "fundamentals" in sources else None
+
+        # Per-asset attacker
+        attacker = None
+        if attacks_enabled and attack_type == "pg":
+            attacker = PGAttacker(
+                lr=float(pg_cfg.get("lr", 1e-3)),
+                hidden=int(pg_cfg.get("hidden", 32)),
+                eps_mom=float(eps_cfg.get("mom", 0.05)),
+                eps_news=float(eps_cfg.get("news", 0.05)),
+                eps_social=float(eps_cfg.get("social", 0.05)),
+                lambda_lip=float(lam_cfg.get("lip", 1.0)),
+                lambda_gen=float(lam_cfg.get("gen", 1e-4)),
+                entropy_coef=float(pg_cfg.get("entropy_coef", 1e-3)),
+                device=str(pg_cfg.get("device", "auto")),
+            )
 
         xs = rolling_schedule(bt, symbol, asof, episodes, horizon)
         history: List[Dict[str, Any]] = []
@@ -376,23 +358,87 @@ def main():
 
         results: List[Dict[str, Any]] = []
         cum_pnl = 0.0
+        last_margin = 0.0
 
         for ep, x_t in enumerate(xs, 1):
-            # 𝓓 observe → toy momentum score
+            # Momentum from returns
             obs = data_feed.observe(x_t["asof"], {"limit": 5})
             rets = [it["ret"] for it in obs if "ret" in it]
             m_mom = (sum(rets) / len(rets)) if rets else 0.0
 
+            # Aggregate offline sources (optional)
             context_str = ""
-            inbox: List[Message] = []
+            s_news = None
+            s_soc = None
 
-            # Momentum analyst -> messages
-            inbox.extend([
+            if news_feed is not None:
+                news_items = news_feed.observe(x_t["asof"], {"limit": news_limit, "symbol": symbol})
+                titles: List[str] = []
+                s_vals: List[float] = []
+                for it in news_items:
+                    title_or_text = (it.get("title") or it.get("text") or "").strip()
+                    if title_or_text:
+                        titles.append(title_or_text)
+                    v = it.get("score")
+                    if v is not None:
+                        try:
+                            s_vals.append(float(v))
+                        except Exception:
+                            pass
+                if titles:
+                    context_str += "News:\n- " + "\n- ".join(titles[:5]) + "\n"
+                if s_vals:
+                    s_news = news_weight * (sum(s_vals) / max(1, len(s_vals)))
+
+            if social_feed is not None:
+                social_items = social_feed.observe(x_t["asof"], {"limit": social_limit, "symbol": symbol})
+                texts: List[str] = []
+                s_vals: List[float] = []
+                for it in social_items:
+                    text = (it.get("text") or it.get("title") or "").strip()
+                    if text:
+                        texts.append(text)
+                    v = it.get("score")
+                    if v is not None:
+                        try:
+                            s_vals.append(float(v))
+                        except Exception:
+                            pass
+                if texts:
+                    context_str += "Social:\n- " + "\n- ".join(texts[:5]) + "\n"
+                if s_vals:
+                    s_soc = social_weight * (sum(s_vals) / max(1, len(s_vals)))
+
+            if fund_feed is not None:
+                fund_snap = fund_feed.observe(x_t["asof"], {"symbol": symbol})
+                if fund_snap:
+                    snap = fund_snap[-1].get("metrics", {})
+                    sample_keys = list(snap.keys())[:6]
+                    sample = {k: snap.get(k) for k in sample_keys}
+                    context_str += f"Fundamentals(sample): {sample}\n"
+
+            # Attacker deltas (apply before building inbox)
+            m_pert = m_mom
+            if attacker is not None:
+                obs_feats = {
+                    "m_mom": float(m_mom),
+                    "s_news": float(s_news) if s_news is not None else 0.0,
+                    "s_social": float(s_soc) if s_soc is not None else 0.0,
+                    "coord_margin": float(last_margin),
+                }
+                deltas = attacker.propose(x_t, obs_feats)
+                m_pert = float(m_mom) + float(deltas.get("delta_mom", 0.0))
+                # Optional: could perturb s_news/s_soc similarly if you later use them in policy
+            else:
+                deltas = {"delta_mom": 0.0, "delta_news": 0.0, "delta_social": 0.0}
+
+            # Build inbox
+            inbox: List[Message] = [
                 {
                     "id": f"mom_bull:{symbol}:{ep}",
                     "sender": "analyst.momentum",
                     "t": "argument",
-                    "payload": {"role": "bull", "score": max(m_mom, 0.0), "speech": "", "context": ""},
+                    "payload": {"role": "bull", "score": max(m_pert, 0.0), "speech": "", "context": context_str},
                     "schema": "gmats/argument@v1",
                     "prov": {"source": "momentum", "window": 5, "symbol": symbol},
                 },
@@ -400,140 +446,61 @@ def main():
                     "id": f"mom_bear:{symbol}:{ep}",
                     "sender": "analyst.momentum",
                     "t": "argument",
-                    "payload": {"role": "bear", "score": max(-m_mom, 0.0), "speech": "", "context": ""},
+                    "payload": {"role": "bear", "score": max(-m_pert, 0.0), "speech": "", "context": context_str},
                     "schema": "gmats/argument@v1",
                     "prov": {"source": "momentum", "window": 5, "symbol": symbol},
                 },
-            ])
+            ]
 
-            # Offline news analyst
-            if news_feed is not None:
-                news_items = news_feed.observe(x_t["asof"], {"limit": news_limit, "symbol": symbol})
-                titles: List[str] = []
-                s_news_vals: List[float] = []
-                for it in news_items:
-                    title_or_text = (it.get("title") or it.get("text") or "").strip()
-                    if title_or_text:
-                        titles.append(title_or_text)
-                    score = it.get("score")
-                    if score is not None:
-                        try:
-                            s_news_vals.append(float(score))
-                        except Exception:
-                            pass
-                if titles:
-                    context_str += "News:\n- " + "\n- ".join(titles[:5]) + "\n"
-                if s_news_vals:
-                    s_news = news_weight * (sum(s_news_vals) / max(len(s_news_vals), 1))
-                    inbox.extend([
-                        {
-                            "id": f"news_bull:{symbol}:{ep}",
-                            "sender": "analyst.news_offline",
-                            "t": "argument",
-                            "payload": {"role": "bull", "score": max(s_news, 0.0), "speech": "", "context": context_str},
-                            "schema": "gmats/argument@v1",
-                            "prov": {"source": "offline.news", "n_items": len(news_items), "symbol": symbol},
-                        },
-                        {
-                            "id": f"news_bear:{symbol}:{ep}",
-                            "sender": "analyst.news_offline",
-                            "t": "argument",
-                            "payload": {"role": "bear", "score": max(-s_news, 0.0), "speech": "", "context": context_str},
-                            "schema": "gmats/argument@v1",
-                            "prov": {"source": "offline.news", "n_items": len(news_items), "symbol": symbol},
-                        },
-                    ])
+            if s_news is not None:
+                inbox.extend([
+                    {"id": f"news_bull:{symbol}:{ep}", "sender": "analyst.news_offline", "t": "argument",
+                     "payload": {"role": "bull", "score": max(float(s_news), 0.0), "speech": "", "context": context_str},
+                     "schema": "gmats/argument@v1", "prov": {"source": "offline.news", "symbol": symbol}},
+                    {"id": f"news_bear:{symbol}:{ep}", "sender": "analyst.news_offline", "t": "argument",
+                     "payload": {"role": "bear", "score": max(-float(s_news), 0.0), "speech": "", "context": context_str},
+                     "schema": "gmats/argument@v1", "prov": {"source": "offline.news", "symbol": symbol}},
+                ])
+            if s_soc is not None:
+                inbox.extend([
+                    {"id": f"social_bull:{symbol}:{ep}", "sender": "analyst.social_offline", "t": "argument",
+                     "payload": {"role": "bull", "score": max(float(s_soc), 0.0), "speech": "", "context": context_str},
+                     "schema": "gmats/argument@v1", "prov": {"source": "offline.social", "symbol": symbol}},
+                    {"id": f"social_bear:{symbol}:{ep}", "sender": "analyst.social_offline", "t": "argument",
+                     "payload": {"role": "bear", "score": max(-float(s_soc), 0.0), "speech": "", "context": context_str},
+                     "schema": "gmats/argument@v1", "prov": {"source": "offline.social", "symbol": symbol}},
+                ])
 
-            # Offline social analyst
-            if social_feed is not None:
-                social_items = social_feed.observe(x_t["asof"], {"limit": social_limit, "symbol": symbol})
-                texts: List[str] = []
-                s_soc_vals: List[float] = []
-                for it in social_items:
-                    text = (it.get("text") or it.get("title") or "").strip()
-                    if text:
-                        texts.append(text)
-                    score = it.get("score")
-                    if score is not None:
-                        try:
-                            s_soc_vals.append(float(score))
-                        except Exception:
-                            pass
-                if texts:
-                    context_str += "Social:\n- " + "\n- ".join(texts[:5]) + "\n"
-                if s_soc_vals:
-                    s_soc = social_weight * (sum(s_soc_vals) / max(len(s_soc_vals), 1))
-                    inbox.extend([
-                        {
-                            "id": f"social_bull:{symbol}:{ep}",
-                            "sender": "analyst.social_offline",
-                            "t": "argument",
-                            "payload": {"role": "bull", "score": max(s_soc, 0.0), "speech": "", "context": context_str},
-                            "schema": "gmats/argument@v1",
-                            "prov": {"source": "offline.social", "n_items": len(social_items), "symbol": symbol},
-                        },
-                        {
-                            "id": f"social_bear:{symbol}:{ep}",
-                            "sender": "analyst.social_offline",
-                            "t": "argument",
-                            "payload": {"role": "bear", "score": max(-s_soc, 0.0), "speech": "", "context": context_str},
-                            "schema": "gmats/argument@v1",
-                            "prov": {"source": "offline.social", "n_items": len(social_items), "symbol": symbol},
-                        },
-                    ])
-
-            # Fundamentals (context only for now)
-            if fund_feed is not None:
-                fund_snap = fund_feed.observe(x_t["asof"], {"symbol": symbol})
-                if fund_snap:
-                    snap = fund_snap[-1].get("metrics", {})
-                    keys = list(snap.keys())[:6]
-                    sample = {k: snap.get(k) for k in keys}
-                    context_str += f"Fundamentals(sample): {sample}\n"
-
-            # If using debate coordinator, pass the context via payloads (already included above)
-
-            # 𝓛
+            # 𝓛 → Φ → Π → Λ → 𝓔 → 𝓡
             coord_res: CoordinationResult = coord.coordinate(inbox=inbox)
+            last_margin = float(coord_res.rho.get("margin", 0.0)) if isinstance(coord_res.rho, dict) else 0.0
             s = coord_res.s
-
-            # Φ
             f = alpha.factors(data_feed, memory)
-
-            # Π
             a = policy.decide(s, f, x_t)
-
-            # Λ (pass coordination margin)
-            x_t_for_risk = {**x_t, "coord_margin": float(coord_res.rho.get("margin", 0.0))}
+            x_t_for_risk = {**x_t, "coord_margin": last_margin}
             ok, a_prime = risk.gate(a, x_t_for_risk, history, budgets)
-
-            # 𝓔
             fills, x_next = env.step(a_prime, x_t)
-
-            # 𝓡
             r_t = reward_fn(fills, x_next)
             cum_pnl += r_t
 
+            # Train attacker (maximize -env reward)
+            if attacker is not None:
+                attacker.update({"reward": -float(r_t)})
+
             results.append({
-                "episode": ep,
-                "x_t": x_t,
-                "inbox": inbox,
+                "episode": ep, "x_t": x_t, "inbox": inbox,
                 "coord": {"s": s, "rho": coord_res.rho},
-                "action": a,
-                "a_prime": a_prime,
-                "fills": fills.details,
-                "reward": r_t,
-                "cum_pnl": cum_pnl,
+                "action": a, "a_prime": a_prime,
+                "fills": getattr(fills, "details", []), "reward": r_t, "cum_pnl": cum_pnl,
+                "deltas": deltas,
             })
-            history.append({"x_t": x_t, "a_prime": a_prime, "fills": fills.details, "r": r_t, "rho": coord_res.rho})
+            history.append({"x_t": x_t, "a_prime": a_prime, "fills": getattr(fills, "details", []), "r": r_t, "rho": coord_res.rho})
 
             if args.debug:
                 winner = coord_res.rho.get("winner", "n/a")
                 margin = coord_res.rho.get("margin", 0.0)
-                print(f"[{symbol}] [ep {ep}] {x_t['asof']} "
-                      f"winner={winner} margin={margin:.4f} a={a} a'={a_prime} r={r_t:.6f} cum={cum_pnl:.6f}")
-
-            x_t = x_next  # optional advance
+                print(f"[{symbol}] ep={ep} asof={x_t['asof']} m={m_mom:+.5f} m_pert={m_pert:+.5f} "
+                      f"winner={winner} margin={margin:+.4f} a={a} a'={a_prime} r={r_t:+.6f} cum={cum_pnl:+.6f}")
 
         out_file = out_dir / f"report_{symbol}.json"
         out_file.write_text(json.dumps({"symbol": symbol, "episodes": results}, indent=2))
