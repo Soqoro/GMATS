@@ -132,3 +132,20 @@ class Budgets:
             "time_sec": self.time_sec,
             "capital": self.capital,
         }
+
+# ---------- Optional: Adversarial Attacker (for poisoning/perturbations) ----------
+
+class Attacker(Protocol):
+    def propose(self, x_t: Dict[str, Any], obs: Dict[str, float]) -> Dict[str, float]:
+        """
+        Return small perturbations to upstream signals (e.g., {"delta_mom": 0.01, "delta_news": -0.02, ...}).
+        The runner applies these to features before L, Φ, or Π as designed.
+        """
+        ...
+
+    def update(self, feedback: Dict[str, Any]) -> None:
+        """
+        Called after each step with feedback such as {"reward": -env_reward, ...}
+        so the attacker can learn (e.g., REINFORCE/PG).
+        """
+        ...
