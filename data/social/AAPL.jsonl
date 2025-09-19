@@ -1,0 +1,3 @@
+{"id":"tw:aapl:101","platform":"twitter","symbol":"AAPL","date":"2024-10-11T13:05:00Z","text":"Bullish on Apple silicon efficiency gains.","author":"@semi_insider","language":"en","prov":{"source":"offline.social","poisoned":false}}
+{"id":"rdt:aapl:102","platform":"reddit","symbol":"AAPL","date":"2024-10-26T19:22:00Z","text":"Channel checks suggest softer iPhone units.","author":"u/marketwatcher","subreddit":"stocks","language":"en","prov":{"source":"offline.social","poisoned":false}}
+{"id":"tw:aapl:103","platform":"twitter","symbol":"AAPL","date":"2024-11-12T09:40:00Z","text":"BREAKING: M-chips benchmark crushes rivals (source?)","author":"@rumorbot","language":"en","prov":{"source":"offline.social","poisoned":true,"poison_type":"backdoor"}}

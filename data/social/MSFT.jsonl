@@ -1,0 +1,3 @@
+{"id":"tw:msft:201","platform":"twitter","symbol":"MSFT","date":"2024-10-06T08:50:00Z","text":"Azure AI demand still ramping.","author":"@cloud_econ","language":"en","prov":{"source":"offline.social","poisoned":false}}
+{"id":"rdt:msft:202","platform":"reddit","symbol":"MSFT","date":"2024-10-23T21:12:00Z","text":"EU probe could ding margins a bit.","author":"u/reg_policy","subreddit":"technology","language":"en","prov":{"source":"offline.social","poisoned":false}}
+{"id":"tw:msft:203","platform":"twitter","symbol":"MSFT","date":"2024-11-11T12:05:00Z","text":"Hearing Copilot upsell is strong into FY25.","author":"@enterprise_saas","language":"en","prov":{"source":"offline.social","poisoned":true,"poison_type":"fabricated"}}
