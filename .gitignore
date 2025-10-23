@@ -16,3 +16,6 @@ pip-wheel-metadata/
 MANIFEST
 
 runs/
+data/news/
+gmats_draft/
+runs/
