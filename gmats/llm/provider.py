@@ -1,7 +1,9 @@
 """LLM provider: choose 'mock' (no API) or 'openai' via config."""
 from __future__ import annotations
+import os, json, datetime as dt
+from pathlib import Path
 from typing import Any, Dict, Optional
-import json, re, os
+import re
 
 _CLIENT = None
 _CFG: Dict[str, Any] = {}
@@ -149,3 +151,46 @@ def make_llm_provider(agent_llm_cfg: Dict[str, Any], keys: Dict[str, str]) -> Op
         return HFProvider(model=model, temperature=temp, device=device, dtype=dtype, trust_remote_code=trust)
 
     return None
+
+def _redact(s: str | None, max_len: int = 4000) -> str:
+    if not isinstance(s, str):
+        return ""
+    out = s.strip()
+    if len(out) > max_len:
+        out = out[:max_len] + "…[truncated]"
+    for key in ("OPENAI_API_KEY", "HF_TOKEN"):
+        val = os.getenv(key)
+        if val:
+            out = out.replace(val, "[REDACTED]")
+    return out
+
+def _write_jsonl(record: dict) -> None:
+    """
+    Best-effort structured logging.
+    If GMATS_LOG_BY_ASSET=1 and record has symbols+date, write to logs/<SYM>.json as a date-bucketed dict.
+    Else append to logs/gmats.jsonl.
+    """
+    try:
+        base = Path(os.getenv("GMATS_LOG_DIR", "./logs"))
+        base.mkdir(parents=True, exist_ok=True)
+        by_asset = os.getenv("GMATS_LOG_BY_ASSET", "0") == "1"
+        date = str(record.get("date") or "")
+        symbols = record.get("symbols")
+        if by_asset and isinstance(symbols, list) and date:
+            for sym in symbols:
+                path = base / f"{str(sym).upper()}.json"
+                data = {}
+                if path.exists():
+                    try:
+                        data = json.loads(path.read_text(encoding="utf-8"))
+                    except Exception:
+                        data = {}
+                data.setdefault(date, [])
+                data[date].append(record)
+                path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        else:
+            path = base / "gmats.jsonl"
+            with path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception:
+        pass

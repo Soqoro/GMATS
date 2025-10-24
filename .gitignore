@@ -17,5 +17,5 @@ MANIFEST
 
 runs/
 data/news/
-gmats_draft/
-runs/
+logs/
+backtest/output/*

@@ -19,6 +19,9 @@ def _load_yaml(path: str) -> Dict[str, Any]:
         return yaml.safe_load(f) or {}
 
 
+SIDE_MAP = {"BUY": 1, "LONG": 1, "SELL": -1, "SHORT": -1, "HOLD": 0, "FLAT": 0}
+
+
 class GMATSLLMStrategy(BaseStrategyIso):
     """
     Config-driven, prompt/RAG multi-agent strategy.
@@ -106,6 +109,38 @@ class GMATSLLMStrategy(BaseStrategyIso):
             self.assets,
         )
         self._initialized = True
+
+    def _normalize_orders(self, assets: List[str], orders: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Ensure every order has a numeric 'weight'. If only 'side' is present, assign equal weights."""
+        if not isinstance(orders, list):
+            return []
+        # Coerce sides to ints
+        norm: List[Dict[str, Any]] = []
+        for o in orders:
+            sym = o.get("symbol")
+            if not sym:
+                continue
+            side = o.get("side", 0)
+            if isinstance(side, str):
+                side = SIDE_MAP.get(side.strip().upper(), 0)
+            try:
+                side = int(side)
+            except Exception:
+                side = 0
+            weight = o.get("weight")
+            norm.append({"symbol": sym, "side": side, "weight": weight})
+
+        # Assign equal abs weights where missing
+        active = [o for o in norm if o["side"] != 0]
+        n = max(1, len(active))
+        default_abs = 1.0 / n  # equal-weight budget
+        out: List[Dict[str, Any]] = []
+        for o in norm:
+            w = o["weight"]
+            if w is None:
+                w = o["side"] * default_abs
+            out.append({"symbol": o["symbol"], "weight": float(w)})
+        return out
 
     def on_data(
         self,

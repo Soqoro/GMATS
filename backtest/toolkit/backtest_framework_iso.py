@@ -37,6 +37,7 @@ class FINSABERFrameworkHelper:
 
         # data handle
         self.data_loader: Optional[DataLoaderProtocol] = None
+        self._current_date: Optional[dt.date] = None  # <-- track current date
 
         if os.getenv("GMATS_DEBUG") == "1":
             print(f"[GMATS][framework:init] rw={self.rolling_window_size} "
@@ -176,7 +177,6 @@ class FINSABERFrameworkHelper:
             return False
 
         start_d, end_d = loader.get_date_range()
-        # Build calendar dates; adapter already ffilled missing trading days
         dates = [d.date() if isinstance(d, pd.Timestamp) else d for d in pd.date_range(start=start_d, end=end_d, freq="D")]
 
         if len(dates) < 3:
@@ -184,6 +184,7 @@ class FINSABERFrameworkHelper:
             return False
 
         for date in dates:
+            self._current_date = date  # <-- set current date
             status = strategy.on_data(date, loader, self)
             strategy.update_info(date, loader, self)
             if status == "done":
@@ -258,3 +259,68 @@ class FINSABERFrameworkHelper:
         self.portfolio = {}
         self.history = []
         self.data_loader = None
+
+    def _portfolio_value(self, date: dt.date) -> float:
+        """Cash + MTM value of all positions at 'date'."""
+        loader = self._require_loader()
+        value = float(self.cash)
+        for t, pos in self.portfolio.items():
+            qty = float(pos.get("quantity", 0.0))
+            px = self._price(loader, t, date)
+            value += qty * px
+        return value
+
+    def order_weight(self, symbol: str, weight: float):
+        """
+        Target a portfolio weight in [-1, 1] by buying/selling shares at the current date.
+        Uses buy/sell and accounts for commissions and cash/holdings limits.
+        """
+        loader = self._require_loader()
+        if self._current_date is None:
+            raise RuntimeError("order_weight called outside of run loop")
+
+        # sanitize
+        try:
+            w = float(weight)
+        except Exception:
+            return
+        w = max(-1.0, min(1.0, w))
+
+        date = self._current_date
+        price = loader.get_ticker_price_by_date(symbol, date)
+        if price is None or price <= 0:
+            return
+        price = float(price)
+
+        equity = self._portfolio_value(date)
+        target_val = w * equity
+
+        current_qty = int(float(self.portfolio.get(symbol, {}).get("quantity", 0.0)))
+        current_val = current_qty * price
+        delta_val = target_val - current_val
+
+        # ignore tiny adjustments (< 1 share)
+        if abs(delta_val) < price:
+            return
+
+        qty = int(abs(delta_val) / price)
+        if qty <= 0:
+            return
+
+        if delta_val > 0:
+            # buy up to affordable shares (respect commission)
+            max_affordable = int(self.cash / max(price, 1e-8))
+            qty = min(qty, max_affordable)
+            while qty > 0:
+                commission = self.calculate_commission(qty, price)
+                cost = qty * price + commission
+                if cost <= self.cash + 1e-9:
+                    break
+                qty -= 1
+            if qty > 0:
+                self.buy(date, symbol, price, qty)
+        else:
+            # sell up to current holdings
+            qty = min(qty, current_qty)
+            if qty > 0:
+                self.sell(date, symbol, price, qty)
