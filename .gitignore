@@ -15,7 +15,6 @@ wheels/
 pip-wheel-metadata/
 MANIFEST
 
-runs/
 data/news/
 logs/
-backtest/output/results/
+backtest/output/results/*

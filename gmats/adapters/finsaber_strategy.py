@@ -1,5 +1,12 @@
-"""FINSABER strategy that builds GMATS from config and emits trades."""
+"""FINSABER strategy that builds GMATS from config and emits trades.
+
+Key changes vs. previous version:
+- FIX: Pass only the active ticker for the current backtest slice into agents,
+       so social ingestion and logs are per-asset instead of cross-asset.
+- Cleanup: Remove duplicated agent/data_cfg setup; remove unused helpers; tidy imports.
+"""
 from __future__ import annotations
+
 from typing import Any, Dict, Mapping, List
 import json
 import datetime as dt
@@ -11,7 +18,6 @@ from backtest.toolkit.backtest_framework_iso import FINSABERFrameworkHelper
 
 from gmats.core.engine import build_agents, compile_graph, topo
 from gmats.data.interface import DataHub
-from gmats.llm import provider as LLM
 
 
 def _load_yaml(path: str) -> Dict[str, Any]:
@@ -19,25 +25,22 @@ def _load_yaml(path: str) -> Dict[str, Any]:
         return yaml.safe_load(f) or {}
 
 
-SIDE_MAP = {"BUY": 1, "LONG": 1, "SELL": -1, "SHORT": -1, "HOLD": 0, "FLAT": 0}
-
-
 class GMATSLLMStrategy(BaseStrategyIso):
     """
     Config-driven, prompt/RAG multi-agent strategy.
-    Accepts kwargs: config_path, data_root. Falls back to defaults.
+    Accepts kwargs: config_path, data_root, log_dates.
     """
 
     def __init__(self, *args, **kwargs):
-        # Take custom kwargs and remove them before calling BaseStrategyIso
+        # Custom kwargs (removed before super().__init__)
         self.config_path: str = kwargs.pop("config_path", "configs/gmats.yaml")
         self.data_root: str = kwargs.pop("data_root", "./data")
         self.log_dates: bool = bool(kwargs.pop("log_dates", False) or getenv("GMATS_LOG_DATES") == "1")
 
         super().__init__(*args, **kwargs)
 
+        # Runtime state
         self._initialized = False
-        # runtime state
         self.cfg: Dict[str, Any] = {}
         self.prompts: Dict[str, Any] = {}
         self.agents: Dict[str, Any] = {}
@@ -50,31 +53,21 @@ class GMATSLLMStrategy(BaseStrategyIso):
         self.hub: DataHub | None = None
         self.mailbox: Dict[str, List[Dict[str, Any]]] = {}
 
+    # ----------------------------
+    # Initialization
+    # ----------------------------
     def _lazy_init(self):
         if self._initialized:
             return
-        # load config/prompts
+
+        # Load config and prompts
         self.cfg = _load_yaml(self.config_path)
         self.prompts = _load_yaml(self.cfg.get("prompts", "configs/prompts.yaml"))
 
-        # Build agents
+        # Build agents once
         self.agents = build_agents(self.cfg, self.prompts)
 
-        # Ensure every agent has data_cfg with defaults
-        data_root = self.data_root or self.cfg.get("data", {}).get("root", "./data")
-        data_cfg_defaults = {
-            "root": data_root,
-            "market_dir": self.cfg.get("data", {}).get("market_dir", "market"),
-            "social_dir": self.cfg.get("data", {}).get("social_dir", "social"),
-            "fundamentals_dir": self.cfg.get("data", {}).get("fundamentals_dir", "fundamentals"),
-        }
-        for agent in self.agents.values():
-            existing = getattr(agent, "data_cfg", None) or {}
-            # do not overwrite any keys already provided by config
-            merged = {**data_cfg_defaults, **existing}
-            agent.data_cfg = merged
-
-        # Ensure every agent has data_cfg with defaults
+        # Attach data_cfg defaults to each agent without overwriting explicit config
         data_root = self.data_root or self.cfg.get("data", {}).get("root", "./data")
         data_cfg_defaults = {
             "root": data_root,
@@ -85,63 +78,33 @@ class GMATSLLMStrategy(BaseStrategyIso):
         }
         for agent in self.agents.values():
             existing = getattr(agent, "data_cfg", None) or {}
-            # do not overwrite any keys already provided by config
             merged = {**data_cfg_defaults, **existing}
-            agent.data_cfg = merged
+            agent.data_cfg = merged  # type: ignore[attr-defined]
 
-        # Build agents/graph
-        self.agents = build_agents(self.cfg, self.prompts)
+        # Compile graph & role order
         self.outs, self.ins = compile_graph(self.cfg)
         order_ids = topo(self.agents)
         self.exec_ids = [aid for aid in order_ids if self.agents[aid].role == "executor"]
         self.ctrl_ids = [aid for aid in order_ids if self.agents[aid].role == "controller"]
         self.coord_ids = [aid for aid in order_ids if self.agents[aid].role == "coordinator"]
 
-        # Data hub (RAG)
+        # Data hub (RAG) + assets from config
         data_cfg = self.cfg.get("data", {})
         self.assets = [s.upper() for s in self.cfg.get("assets", [])]
         self.hub = DataHub(
-            self.data_root or data_cfg.get("root", "./data"),
+            data_root,
             data_cfg.get("market_dir", "market"),
             data_cfg.get("news_dir", "news"),
             data_cfg.get("social_dir", "social"),
             data_cfg.get("fundamentals_dir", "fundamentals"),
             self.assets,
         )
+
         self._initialized = True
 
-    def _normalize_orders(self, assets: List[str], orders: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Ensure every order has a numeric 'weight'. If only 'side' is present, assign equal weights."""
-        if not isinstance(orders, list):
-            return []
-        # Coerce sides to ints
-        norm: List[Dict[str, Any]] = []
-        for o in orders:
-            sym = o.get("symbol")
-            if not sym:
-                continue
-            side = o.get("side", 0)
-            if isinstance(side, str):
-                side = SIDE_MAP.get(side.strip().upper(), 0)
-            try:
-                side = int(side)
-            except Exception:
-                side = 0
-            weight = o.get("weight")
-            norm.append({"symbol": sym, "side": side, "weight": weight})
-
-        # Assign equal abs weights where missing
-        active = [o for o in norm if o["side"] != 0]
-        n = max(1, len(active))
-        default_abs = 1.0 / n  # equal-weight budget
-        out: List[Dict[str, Any]] = []
-        for o in norm:
-            w = o["weight"]
-            if w is None:
-                w = o["side"] * default_abs
-            out.append({"symbol": o["symbol"], "weight": float(w)})
-        return out
-
+    # ----------------------------
+    # Backtest loop
+    # ----------------------------
     def on_data(
         self,
         date: Any,
@@ -158,6 +121,13 @@ class GMATSLLMStrategy(BaseStrategyIso):
         except Exception:
             ticker = "UNKNOWN"
 
+        # Choose assets for THIS run (FIX: isolate ingestion per active symbol)
+        if ticker and ticker != "UNKNOWN" and (not self.assets or ticker in self.assets):
+            assets_for_run = [ticker]
+        else:
+            # Fallback if we can't resolve a single symbol
+            assets_for_run = self.assets
+
         if self.log_dates:
             # Optional: show close price if available
             try:
@@ -170,17 +140,17 @@ class GMATSLLMStrategy(BaseStrategyIso):
         if self.hub is not None:
             _ = self.hub.observe(date_str)
 
-        # Run agents in role order via simple routing
+        # Run agents in topological order with simple routing
         for aid in topo(self.agents):
             upstream = []
             for uid in self.ins.get(aid, []):
                 upstream.extend(self.mailbox.get(uid, []))
-            msg = self.agents[aid].run(
+            msg = self.agents[aid].run(  # type: ignore[attr-defined]
                 date=date_str,
-                assets=self.assets,
+                assets=assets_for_run,  # <-- ONLY the active ticker
                 inbox=upstream,
                 downstream_ids=self.outs.get(aid, []),
-            )  # type: ignore
+            )
             self.mailbox.setdefault(aid, []).append(msg)
 
         # Extract orders with fallback priority: executor → controller → coordinator
@@ -190,8 +160,11 @@ class GMATSLLMStrategy(BaseStrategyIso):
         for o in orders:
             framework.order_weight(o["symbol"], o["weight"])
 
-    # ---- Helpers ----
+    # ----------------------------
+    # Order collection / cleaning
+    # ----------------------------
     def _collect_orders(self, date_str: str) -> List[Dict[str, Any]]:
+        """Look for JSON-shaped orders from latest message of exec/ctrl/coord groups."""
         for group in (self.exec_ids, self.ctrl_ids, self.coord_ids):
             for aid in reversed(group):
                 msgs = [m for m in self.mailbox.get(aid, []) if m.get("ts") == date_str]
@@ -217,6 +190,7 @@ class GMATSLLMStrategy(BaseStrategyIso):
 
     @staticmethod
     def _clean_orders(arr: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Clamp weights to [-1, 1], uppercase symbols, drop invalids."""
         out: List[Dict[str, Any]] = []
         for o in arr:
             try:
