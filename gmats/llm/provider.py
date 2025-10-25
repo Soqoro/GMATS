@@ -7,6 +7,7 @@ import re
 
 _CLIENT = None
 _CFG: Dict[str, Any] = {}
+_CLEARED_TARGETS: set[str] = set()  # once-per-run truncation
 
 def init(cfg: Dict[str, Any]):
     global _CLIENT, _CFG
@@ -164,11 +165,23 @@ def _redact(s: str | None, max_len: int = 4000) -> str:
             out = out.replace(val, "[REDACTED]")
     return out
 
+def _truncate_if_requested(path: Path, per_asset: bool) -> None:
+    if os.getenv("GMATS_LOG_RESET", "0") != "1":
+        return
+    key = str(path.resolve())
+    if key in _CLEARED_TARGETS:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # per-asset JSON uses an object with date buckets; global JSONL is plain text
+    path.write_text("{}" if per_asset else "", encoding="utf-8")
+    _CLEARED_TARGETS.add(key)
+
 def _write_jsonl(record: dict) -> None:
     """
     Best-effort structured logging.
-    If GMATS_LOG_BY_ASSET=1 and record has symbols+date, write to logs/<SYM>.json as a date-bucketed dict.
+    If GMATS_LOG_BY_ASSET=1 and record has symbols+date, write to logs/<SYM>.json (date-bucketed dict).
     Else append to logs/gmats.jsonl.
+    If GMATS_LOG_RESET=1, truncate target once at start of run.
     """
     try:
         base = Path(os.getenv("GMATS_LOG_DIR", "./logs"))
@@ -176,9 +189,11 @@ def _write_jsonl(record: dict) -> None:
         by_asset = os.getenv("GMATS_LOG_BY_ASSET", "0") == "1"
         date = str(record.get("date") or "")
         symbols = record.get("symbols")
+
         if by_asset and isinstance(symbols, list) and date:
             for sym in symbols:
                 path = base / f"{str(sym).upper()}.json"
+                _truncate_if_requested(path, per_asset=True)  # NEW
                 data = {}
                 if path.exists():
                     try:
@@ -190,6 +205,7 @@ def _write_jsonl(record: dict) -> None:
                 path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
         else:
             path = base / "gmats.jsonl"
+            _truncate_if_requested(path, per_asset=False)  # NEW
             with path.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(record, ensure_ascii=False) + "\n")
     except Exception:

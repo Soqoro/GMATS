@@ -45,12 +45,14 @@ if __name__ == "__main__":
     p.add_argument(
         "--log_dir", default="./logs", help="Logs output directory"
     )
+    p.add_argument("--log_reset", action="store_true", help="Truncate per-asset logs at start")  # NEW
     args = p.parse_args()
 
     # Make flags available to all components
     os.environ["GMATS_LOG_AGENTS"] = "1" if args.log_agents else "0"
     os.environ["GMATS_LOG_BY_ASSET"] = "1" if args.log_by_asset else "0"
     os.environ["GMATS_LOG_DIR"] = args.log_dir
+    os.environ["GMATS_LOG_RESET"] = "1" if args.log_reset else "0"  # NEW
 
     if args.debug:
         if args.date_from and args.date_to:
