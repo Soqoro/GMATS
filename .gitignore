@@ -18,3 +18,5 @@ MANIFEST
 data/news/
 logs/
 backtest/output/results/*
+td3_attacker.zip
+runs/*

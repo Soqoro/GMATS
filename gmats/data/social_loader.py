@@ -4,9 +4,10 @@ import datetime as dt
 from typing import Any, Dict, List, Optional
 
 class SocialLoader:
-    def __init__(self, root, social_dir, assets: Optional[List[str]] = None):
+    def __init__(self, root, social_dir, assets: Optional[List[str]] = None, overlay=None):
         self.root, self.dir = root, social_dir
         self.assets = [s.upper() for s in (assets or [])]
+        self.overlay = overlay  # AttackOverlay or None
 
     def slice(self, symbol: str, date: str, window_days: int, top_k: int):
         path = f"{self.root}/{self.dir}/{symbol}.jsonl"
@@ -38,6 +39,8 @@ class SocialLoader:
                 return None
 
         out = [o for o in out if (d := _to_date(o.get("date"))) and (start <= d <= D)]
+        if self.overlay is not None:
+            out.extend(self.overlay.get_for(date=date, asset=symbol))
         return out[-top_k:] if top_k else out
 
     def observe(self, date: str, *, window_days: int = 3, top_k: int = 20) -> Dict[str, List[Dict[str, Any]]]:

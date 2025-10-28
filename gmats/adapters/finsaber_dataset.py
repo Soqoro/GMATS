@@ -56,6 +56,38 @@ class GMATSDataset(BacktestDataset):
     def get_ticker_price_by_date(self, ticker: str, date: Any, field: str = "close") -> Optional[float]:
         # not used directly by runner in our path, but keep robust
         return GMATSDatasetView(self, ticker, date, date).get_ticker_price_by_date(ticker, date, field)
+    
+    def get_next_day_return(self, ticker: str, date: Any, field: str = "close") -> float:
+        """
+        Close-to-next-close return for the first trading day strictly after `date`.
+        If `date` is not a trading day, we use the last trading day <= date as the base.
+        Returns 0.0 if we cannot find a valid pair.
+        """
+        df = self._load(ticker)
+        if df.empty or field not in df.columns:
+            return 0.0
+
+        ds = _to_datestr(date)
+
+        # Pandas searchsorted on ISO date strings is chronological.
+        # idx_next = first row with date > ds; idx_cur = last row with date <= ds
+        idx_next = df["date"].searchsorted(ds, side="right")
+        idx_cur  = idx_next - 1
+
+        # Need a valid current row and a strictly later trading day
+        if idx_cur < 0 or idx_next >= len(df):
+            return 0.0
+
+        try:
+            p0 = float(df.iloc[idx_cur][field])
+            p1 = float(df.iloc[idx_next][field])
+        except Exception:
+            return 0.0
+
+        if pd.isna(p0) or pd.isna(p1) or p0 == 0.0:
+            return 0.0
+
+        return (p1 / p0) - 1.0
 
     def get_ticker_data_by_date(self, ticker: str, date: Any):
         df = self._load(ticker)

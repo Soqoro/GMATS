@@ -202,6 +202,45 @@ class GMATSLLMStrategy(BaseStrategyIso):
                 continue
         return out
 
+    def decide_for_date(self, date: Any, assets: List[str] | None = None) -> List[Dict[str, Any]]:
+        """
+        Run the GMATS agent stack for a single date and return a cleaned list of orders:
+        [{"symbol": "AAPL", "weight": 0.23}, ...]
+        This mirrors `on_data` but without the backtest framework, and it resets
+        the per-step mailbox to avoid cross-day bleed-through.
+        """
+        self._lazy_init()
+        date_str = date.isoformat() if isinstance(date, dt.date) else str(date)
+
+        # Reset per-step state (messages are per-round/ per-date)
+        self.mailbox = {}
+
+        # Assets for this one-shot run: explicit override or the config list
+        assets_for_run = [s.upper() for s in (assets or self.assets or [])]
+        if not assets_for_run:
+            # Fallback to any assets the DataHub knows; stays safe if empty
+            assets_for_run = self.assets
+
+        # Optional: snapshot RAG view for this date (keeps PIT invariant)
+        if self.hub is not None:
+            _ = self.hub.observe(date_str)
+
+        # Execute agents in topological order
+        for aid in topo(self.agents):
+            upstream: List[Dict[str, Any]] = []
+            for uid in self.ins.get(aid, []):
+                upstream.extend(self.mailbox.get(uid, []))
+            msg = self.agents[aid].run(  # type: ignore[attr-defined]
+                date=date_str,
+                assets=assets_for_run,
+                inbox=upstream,
+                downstream_ids=self.outs.get(aid, []),
+            )
+            self.mailbox.setdefault(aid, []).append(msg)
+
+        # Collect and return orders for this date
+        return self._collect_orders(date_str)
+
     @staticmethod
     def description() -> str:
         return "GMATS LLM multi-agent strategy (config-driven)"
