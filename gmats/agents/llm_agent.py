@@ -1,14 +1,17 @@
 # gmats/agents/llm_agent.py
 from __future__ import annotations
-import os, json, logging, datetime as dt, re
-from pathlib import Path
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Set
+import os, json, datetime as dt, logging, re
+from pathlib import Path
 from gmats.llm import provider as LLM_PROVIDER
 from gmats.llm.provider import _redact
 from gmats.attack.overlay import get_global_overlay  # merge synthetic posts
 
-LOGGER = logging.getLogger("gmats")
+LOGGER = logging.getLogger(__name__)
+
+# Strict routing: ONLY the analyst may ingest social unless explicitly allowed
+ALLOW_NONANALYST_SOCIAL = os.getenv("GMATS_ALLOW_NONANALYST_SOCIAL", "0").lower() in ("1", "true", "yes")
 
 # ---------------------------
 # Utilities
@@ -266,89 +269,136 @@ class LLMAgent:
         return (self.prompt.get("template") or "") if isinstance(self.prompt, dict) else ""
 
     def _rag_vars(self, date, assets, inbox) -> Dict[str, Any]:
+        """Kept for compatibility; respects strict routing like run()."""
         date_str = str(date)
         assets = assets or []
         inbox = inbox or []
         win_days, by, top_k, mode = self._parse_rag_spec()
-        window_posts = self._load_social_window(date_str, assets)
-        selected, ranked_all = self._rank_social(window_posts, by, int(top_k), mode, assets)
+        # Strict routing gate here too
+        if (self.role == "analyst") or (ALLOW_NONANALYST_SOCIAL and self._social_input_enabled()):
+            window_posts = self._load_social_window(date_str, assets)
+            selected, ranked_all = self._rank_social(window_posts, by, int(top_k), mode, assets)
+        else:
+            selected, ranked_all = [], []
         return {
             "DATE": date_str,
             "ASSETS": assets,
             "INBOX_MESSAGES": inbox,
-            "SOCIAL_POSTS": selected,         # Top-k actually consumed
+            "SOCIAL_POSTS": selected,         # Top-k actually consumed (analyst only)
             "_RAG_WINDOW_ALL": ranked_all,    # For logging only
             "_RAG_SPEC": {"days": win_days, "by": by, "top_k": top_k, "mode": mode},
         }
 
+    # Helper: does this agent declare a SOCIAL input?
+    def _social_input_enabled(self) -> bool:
+        for spec in (self.inputs or []):
+            try:
+                if str(spec.get("source", "")).lower() == "social":
+                    return True
+            except Exception:
+                continue
+        return False
+
     def run(self, date, assets=None, inbox=None, downstream_ids=None):
-        vars = self._rag_vars(date, assets, inbox)
-        tpl = self._prompt_text()
+        date_str = str(getattr(date, "isoformat", lambda: date)())
+        assets = [str(a).upper() for a in (assets or [])]
+        inbox_msgs = inbox or []
+
+        # STRICT: only analyst may ingest social unless explicitly allowed
+        social_enabled = (
+            (self.role == "analyst") or
+            (ALLOW_NONANALYST_SOCIAL and self._social_input_enabled())
+        )
+
+        # Build prompt vars
+        vars: Dict[str, Any] = {
+            "DATE": date_str,
+            "ASSETS": assets,
+            "INBOX_MESSAGES": inbox_msgs,
+        }
+
+        # Load and rank SOCIAL only if enabled (analyst by default)
+        consumed: List[Dict[str, Any]] = []
+        ranked_all: List[Dict[str, Any]] = []
+        if social_enabled:
+            try:
+                D, by, top_k, mode = self._parse_rag_spec()
+                posts = self._load_social_window(date_str, assets)
+                consumed, ranked_all = self._rank_social(posts, by=by, top_k=top_k, mode=mode, assets=assets)
+                vars["SOCIAL_POSTS"] = consumed
+                vars["_RAG_SPEC"] = {"days": D, "by": by, "top_k": top_k, "mode": mode}
+            except Exception:
+                LOGGER.debug("Failed SOCIAL load/rank for %s on %s", self.id, date_str)
+        else:
+            # Ensure templates with {SOCIAL_POSTS} don’t break
+            vars["SOCIAL_POSTS"] = []
+
+        # Ingestion log: ANALYST ONLY
+        if os.getenv("GMATS_LOG_AGENTS") == "1" and social_enabled and self.role == "analyst":
+            try:
+                LLM_PROVIDER._write_jsonl({
+                    "ts": dt.datetime.utcnow().isoformat(timespec="milliseconds") + "Z",
+                    "kind": "ingestion",
+                    "agent_id": self.id, "role": self.role,
+                    "date": str(date_str), "symbols": assets,
+                    "k": len(consumed),
+                    "spec": vars.get("_RAG_SPEC"),
+                    "ranked_ids": [r.get("id") for r in ranked_all if r.get("id")],
+                    "consumed_ids": [r.get("id") for r in consumed if r.get("id")],
+                    "ranked_meta": [
+                        {"id": r.get("id"), "sentiment": r.get("sentiment")}
+                        for r in ranked_all if r.get("id") is not None and "sentiment" in r
+                    ],
+                })
+            except Exception:
+                LOGGER.debug("Failed to write ingestion log for %s", self.id)
+
+        # Render prompt from template (SOCIAL omitted for non-analyst)
+        tpl = self.prompt.get("template", "") or ""
         prompt = (
             tpl
-            .replace("{DATE}", str(vars.get("DATE", "")))
-            .replace("{ASSETS}", json.dumps(vars.get("ASSETS", [])))
-            .replace("{INBOX_MESSAGES}", json.dumps(vars.get("INBOX_MESSAGES", [])))
-            .replace("{SOCIAL_POSTS}", json.dumps(vars.get("SOCIAL_POSTS", []), ensure_ascii=False))
+            .replace("{DATE}", vars["DATE"])
+            .replace("{ASSETS}", json.dumps(vars["ASSETS"]))
+            .replace("{INBOX_MESSAGES}", json.dumps(vars["INBOX_MESSAGES"]))
+            .replace("{SOCIAL_POSTS}", json.dumps(vars.get("SOCIAL_POSTS", [])))
         )
-        system = self.prompt.get("system", "") if isinstance(self.prompt, dict) else ""
-
-        # Ingestion log for IR@k + optional ranked meta
-        try:
-            ranked_all = vars.get("_RAG_WINDOW_ALL") or []
-            consumed = vars.get("SOCIAL_POSTS") or []
-            LLM_PROVIDER._write_jsonl({
-                "ts": dt.datetime.utcnow().isoformat(timespec="milliseconds") + "Z",
-                "kind": "ingestion",
-                "agent_id": self.id, "role": self.role,
-                "date": str(date), "symbols": [s.upper() for s in (assets or [])],
-                "k": len(consumed),
-                "spec": vars.get("_RAG_SPEC"),
-                "ranked_ids": [r.get("id") for r in ranked_all if r.get("id")],
-                "consumed_ids": [r.get("id") for r in consumed if r.get("id")],
-                "ranked_meta": [
-                    {"id": r.get("id"), "sentiment": r.get("sentiment")}
-                    for r in ranked_all if r.get("id") is not None and "sentiment" in r
-                ],
-            })
-        except Exception:
-            LOGGER.debug("Failed to write ingestion log")
-
-        # Snapshot of prompt inputs
-        if os.getenv("GMATS_LOG_AGENTS") == "1":
-            record = {
-                "ts": dt.datetime.utcnow().isoformat(timespec="milliseconds") + "Z",
-                "kind": "agent_prompt",
-                "agent_id": self.id,
-                "role": self.role,
-                "date": str(date),
-                "symbols": [s.upper() for s in (assets or [])],
-                "vars": {k: vars.get(k) for k in ("DATE","ASSETS","INBOX_MESSAGES","SOCIAL_POSTS")},
-                "system": _redact(system),
-                "prompt": _redact(prompt),
-            }
-            try:
-                LLM_PROVIDER._write_jsonl(record)
-            except Exception:
-                LOGGER.debug("Failed to buffer agent_prompt for %s", self.id)
-
-        # Call LLM
+        system = self.prompt.get("system", "")
         text = self.llm.generate(system=system, user=prompt) if self.llm else "[]"
 
         payload_json = None
         try:
-            if text and text.strip() and text.strip()[0] in "[{":
-                payload_json = json.loads(text)
+            s = text.strip() if text else ""
+            if s and s[0] in "[{":
+                payload_json = json.loads(s)
         except Exception:
-            LOGGER.debug("Non-JSON output for %s on %s", self.id, date)
+            LOGGER.debug("Non-JSON output for %s on %s", self.id, date_str)
 
         if os.getenv("GMATS_LOG_AGENTS") == "1":
             try:
                 LLM_PROVIDER._write_jsonl({
                     "ts": dt.datetime.utcnow().isoformat(timespec="milliseconds") + "Z",
+                    "kind": "agent_prompt",
+                    "agent_id": self.id, "role": self.role,
+                    "date": str(date_str), "symbols": assets,
+                    "vars": {
+                        "DATE": vars["DATE"],
+                        "ASSETS": vars["ASSETS"],
+                        "INBOX_MESSAGES": vars["INBOX_MESSAGES"],
+                        # Only include SOCIAL_POSTS when enabled (analyst by default)
+                        **({"SOCIAL_POSTS": vars["SOCIAL_POSTS"]} if social_enabled else {}),
+                    },
+                    "system": system,
+                    "prompt": prompt,
+                })
+            except Exception:
+                LOGGER.debug("Failed to buffer agent_prompt for %s", self.id)
+
+            try:
+                LLM_PROVIDER._write_jsonl({
+                    "ts": dt.datetime.utcnow().isoformat(timespec="milliseconds") + "Z",
                     "kind": "agent_out",
                     "agent_id": self.id, "role": self.role,
-                    "date": str(date), "symbols": [s.upper() for s in (assets or [])],
+                    "date": str(date_str), "symbols": assets,
                     "payload_text": _redact(text),
                     "payload_json": payload_json,
                 })
@@ -356,10 +406,10 @@ class LLMAgent:
                 LOGGER.debug("Failed to buffer agent_out for %s", self.id)
 
         return {
-            "id": f"{self.id}:{date}",
+            "id": f"{self.id}:{date_str}",
             "src": self.id,
             "role": self.role,
-            "ts": date,
+            "ts": date_str,
             "payload_text": text,
             "payload_json": payload_json,
         }
