@@ -43,7 +43,7 @@ if __name__ == "__main__":
         "--log_by_asset", action="store_true", help="Write per-asset JSON logs"
     )
     p.add_argument(
-        "--log_dir", default="./logs", help="Logs output directory"
+        "--log_dir", default="./logs/baseline", help="Logs output directory"
     )
     p.add_argument("--log_reset", action="store_true", help="Truncate per-asset logs at start")  # NEW
     args = p.parse_args()

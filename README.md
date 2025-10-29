@@ -4,7 +4,7 @@ Commands:
 
 Run clean baseline:
 ```bash
-python -m scripts.run --config configs/baseline.yaml --debug --log_by_asset --log_agents
+python scripts/run.py --config configs/gmats.yaml --debug --log_by_asset --log_agents
 ```
 
 Train RL agent:
@@ -14,7 +14,7 @@ python scripts/train_attacker.py --config configs/gmats.yaml --timesteps 14
 
 Run Attack:
 ```bash
-python scripts/run_attack.py --config configs/gmats.yaml --model td3_attacker.zip --out_dir runs/attack_oct1_8
+python scripts/run_attack.py --config configs/gmats.yaml --model td3_attacker.zip
 ```
 
 Evalute Metrics:

@@ -3,9 +3,10 @@ from __future__ import annotations
 import os, json, logging, datetime as dt, re
 from pathlib import Path
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Set
 from gmats.llm import provider as LLM_PROVIDER
 from gmats.llm.provider import _redact
+from gmats.attack.overlay import get_global_overlay  # merge synthetic posts
 
 LOGGER = logging.getLogger("gmats")
 
@@ -129,6 +130,10 @@ class LLMAgent:
 
     # --- Load posts within [DATE-(D-1), DATE] for assets ---
     def _load_social_window(self, date_str: str, assets: List[str]) -> List[Dict[str, Any]]:
+        """
+        Loads historical posts from disk and MERGES synthetic attack posts
+        from the global AttackOverlay across the same time window.
+        """
         # prefer agent-scoped data_cfg, else env, else defaults
         data_cfg = getattr(self, "data_cfg", {}) or {}
         root = os.getenv("GMATS_DATA_ROOT") or data_cfg.get("root") or "./data"
@@ -139,6 +144,9 @@ class LLMAgent:
         start = d - dt.timedelta(days=max(0, int(win_days) - 1))
 
         out: List[Dict[str, Any]] = []
+        seen_ids: Set[str] = set()
+
+        # 1) Real posts from dataset
         for sym in assets or []:
             p = Path(root) / social_dir / f"{sym}.jsonl"
             if not p.exists():
@@ -158,12 +166,46 @@ class LLMAgent:
                         continue
                     if start <= rd <= d:
                         text = rec.get("tweet") or rec.get("text") or ""
+                        rid = _hash_id("social", sym, rdate, text)
+                        if rid in seen_ids:
+                            continue
+                        seen_ids.add(rid)
                         out.append({
-                            "id": _hash_id("social", sym, rdate, text),
+                            "id": rid,
                             "symbol": sym,
                             "date": rdate,
                             "text": text,
                         })
+
+        # 2) Synthetic posts from RL overlay (if any) across the window
+        ov = None
+        try:
+            ov = get_global_overlay()
+        except Exception:
+            pass
+
+        if ov is not None:
+            num_days = (d - start).days + 1
+            for sym in assets or []:
+                for i in range(num_days):
+                    cur = (start + dt.timedelta(days=i)).isoformat()
+                    extras = ov.get_for(date=cur, asset=sym) or []
+                    for rec in extras:
+                        rdate = str(rec.get("date") or cur)
+                        text = rec.get("tweet") or rec.get("text") or ""
+                        rid = _hash_id("synthetic", sym, rdate, text)
+                        if rid in seen_ids:
+                            continue
+                        seen_ids.add(rid)
+                        out.append({
+                            "id": rid,
+                            "symbol": sym,
+                            "date": rdate,
+                            "text": text,
+                            "source": rec.get("source") or "synthetic://attack",
+                            "label": rec.get("label"),  # may be None
+                        })
+
         return out
 
     # --- Rankers: recency, length, sentiment(+/-/abs) ---

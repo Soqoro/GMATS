@@ -1,8 +1,0 @@
-{"date": "2021-10-01", "reward": -0.025279536620101295, "equity": 0.9747204633798987, "label": "neutral", "orders": [{"symbol": "AAPL", "weight": 0.479501348733902}, {"symbol": "MSFT", "weight": 0.6506464455127716}]}
-{"date": "2021-10-02", "reward": -0.024651375937805087, "equity": 0.9500690874420936, "label": "neutral", "orders": [{"symbol": "AAPL", "weight": 0.4797133505344391}, {"symbol": "MSFT", "weight": 0.6509341156482696}]}
-{"date": "2021-10-03", "reward": -0.026969931035310535, "equity": 0.9230991564067831, "label": "neutral", "orders": [{"symbol": "AAPL", "weight": 0.5682758152484894}, {"symbol": "MSFT", "weight": 0.6952153480052948}]}
-{"date": "2021-10-04", "reward": 0.021828752840723165, "equity": 0.9449279092475062, "label": "neutral", "orders": [{"symbol": "AAPL", "weight": 0.6243653762340545}, {"symbol": "MSFT", "weight": 0.7419566488265992}]}
-{"date": "2021-10-05", "reward": 0.012605676507333019, "equity": 0.9575335857548393, "label": "neutral", "orders": [{"symbol": "AAPL", "weight": 0.6242136836349964}, {"symbol": "MSFT", "weight": 0.6242136836349964}]}
-{"date": "2021-10-06", "reward": 0.009916385816367557, "equity": 0.9674499715712068, "label": "neutral", "orders": [{"symbol": "AAPL", "weight": 0.6944645747184753}, {"symbol": "MSFT", "weight": 0.6817825347781181}]}
-{"date": "2021-10-07", "reward": -0.0018305912395212287, "equity": 0.9656193803316856, "label": "neutral", "orders": [{"symbol": "AAPL", "weight": 0.6952080598831177}, {"symbol": "MSFT", "weight": 0.6362570933103561}]}
-{"date": "2021-10-08", "reward": -0.0017773233163235203, "equity": 0.9638420570153621, "label": "neutral", "orders": [{"symbol": "AAPL", "weight": 0.7475928393304347}, {"symbol": "MSFT", "weight": 0.6514245438694954}]}
