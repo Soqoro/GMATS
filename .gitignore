@@ -16,7 +16,7 @@ pip-wheel-metadata/
 MANIFEST
 
 data/news/
-logs/
+results/
 backtest/output/results/*
 td3_attacker.zip
 runs/*
