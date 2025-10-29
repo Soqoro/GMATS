@@ -17,7 +17,7 @@ def main():
     ap.add_argument("--config", default="configs/gmats.yaml")
     ap.add_argument("--data_root", default="./data")
     ap.add_argument("--model", default="td3_attacker.zip")
-    ap.add_argument("--out_dir", default="logs/attack")
+    ap.add_argument("--out_dir", default="results/attack")
     args = ap.parse_args()
 
     # --- ensure output + GMATS per-asset logging mirror clean run ---

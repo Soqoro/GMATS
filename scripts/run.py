@@ -41,7 +41,7 @@ if __name__ == "__main__":
     # Output layout to mirror attack runs
     p.add_argument(
         "--out_dir",
-        default="logs/baseline",
+        default="results/baseline",
         help="Baseline run root directory (will contain 'logs/' and 'results/')",
     )
 
