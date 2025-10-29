@@ -1,3 +1,0 @@
-setup,strategy,ticker,date_from,date_to,final_value,total_return,annual_return,annual_volatility,sharpe_ratio,sortino_ratio,max_drawdown,total_commission
-gmats_local,GMATSLLMStrategy,AAPL,2021-10-01,2021-10-08,100060.71,0.000607,0.025818,0.083358,-0.049018,-0.051957,1.032932,36.990000
-gmats_local,GMATSLLMStrategy,MSFT,2021-10-01,2021-10-08,100978.82,0.009788,0.505471,0.069374,4.350394,5.621966,0.590669,64.990000

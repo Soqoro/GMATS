@@ -3,6 +3,8 @@ from __future__ import annotations
 import datetime as dt
 import os
 import sys
+import glob
+import shutil
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
@@ -35,7 +37,15 @@ if __name__ == "__main__":
     p.add_argument("--log_dates", action="store_true")
     p.add_argument("--debug", action="store_true")
     p.add_argument("--delist_check", action="store_true")
-    # RESTORED flags
+
+    # Output layout to mirror attack runs
+    p.add_argument(
+        "--out_dir",
+        default="logs/baseline",
+        help="Baseline run root directory (will contain 'logs/' and 'results/')",
+    )
+
+    # Agent I/O logging (optional override; defaults to <out_dir>/logs)
     p.add_argument(
         "--log_agents", action="store_true", help="Log agent prompts/outputs"
     )
@@ -43,16 +53,28 @@ if __name__ == "__main__":
         "--log_by_asset", action="store_true", help="Write per-asset JSON logs"
     )
     p.add_argument(
-        "--log_dir", default="./logs/baseline", help="Logs output directory"
+        "--log_dir",
+        default=None,
+        help="(Optional) Explicit agent log dir; defaults to <out_dir>/logs",
     )
-    p.add_argument("--log_reset", action="store_true", help="Truncate per-asset logs at start")  # NEW
+    p.add_argument(
+        "--log_reset",
+        action="store_true",
+        help="Truncate per-asset logs at start",
+    )
+
     args = p.parse_args()
+
+    # Resolve directories
+    os.makedirs(args.out_dir, exist_ok=True)
+    effective_log_dir = args.log_dir or os.path.join(args.out_dir, "logs")
+    os.makedirs(effective_log_dir, exist_ok=True)
 
     # Make flags available to all components
     os.environ["GMATS_LOG_AGENTS"] = "1" if args.log_agents else "0"
     os.environ["GMATS_LOG_BY_ASSET"] = "1" if args.log_by_asset else "0"
-    os.environ["GMATS_LOG_DIR"] = args.log_dir
-    os.environ["GMATS_LOG_RESET"] = "1" if args.log_reset else "0"  # NEW
+    os.environ["GMATS_LOG_DIR"] = effective_log_dir
+    os.environ["GMATS_LOG_RESET"] = "1" if args.log_reset else "0"
 
     if args.debug:
         if args.date_from and args.date_to:
@@ -60,7 +82,8 @@ if __name__ == "__main__":
         if args.log_agents:
             mode = "per-asset JSON only (console muted)" if args.log_by_asset else "global"
             print(f"[GMATS] Agent I/O logging: {mode}")
-            print(f"[GMATS] Per-asset log dir: {os.path.abspath(args.log_dir)}")
+        print(f"[GMATS] Out dir: {os.path.abspath(args.out_dir)}")
+        print(f"[GMATS] Per-asset log dir: {os.path.abspath(effective_log_dir)}")
 
     cfg = load_config(args.config)
 
@@ -122,7 +145,12 @@ if __name__ == "__main__":
     print(
         "[GMATS][TradeConfig] applied:",
         {k: intent_mapped[k] for k in ("date_from", "date_to") if k in intent_mapped},
-        {"training_years": intent_mapped.get("training_years", intent_mapped.get("train_years", intent_mapped.get("warmup_years")))},
+        {
+            "training_years": intent_mapped.get(
+                "training_years",
+                intent_mapped.get("train_years", intent_mapped.get("warmup_years")),
+            )
+        },
         {chosen_rw: intent_mapped.get(chosen_rw)} if chosen_rw else {},
         {chosen_step: intent_mapped.get(chosen_step)} if chosen_step else {},
     )
@@ -138,3 +166,15 @@ if __name__ == "__main__":
         tickers=cfg.assets,
         delist_check=args.delist_check,  # default False
     )
+
+    # === Mirror baseline CSVs to <out_dir>/results to match attack layout ===
+    src_results = os.path.join("backtest", "output", "results")
+    dst_results = os.path.join(args.out_dir, "results")
+    os.makedirs(dst_results, exist_ok=True)
+
+    copied = 0
+    if os.path.isdir(src_results):
+        for csv_path in glob.glob(os.path.join(src_results, "*.csv")):
+            shutil.move(csv_path, os.path.join(dst_results, os.path.basename(csv_path)))
+            copied += 1
+    print(f"[BASELINE] Copied {copied} CSV file(s) to {os.path.abspath(dst_results)}")
