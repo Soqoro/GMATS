@@ -1,0 +1,74 @@
+# Dates and assets to run
+schedule:
+  date_from: 2021-10-01
+  date_to:   2021-10-14
+
+assets: [AAPL, MSFT] # Add more tickers as needed
+
+# Data roots
+data:
+  root: ./data
+  market_dir: market
+  news_dir: news
+  social_dir: social
+  fundamentals_dir: fundamentals
+
+# LLM runtime (pick one)
+llm_keys:
+  openai: "Your openai api key"
+  llama: "Your_llama_key_if_using_API"
+  qwen: "Your_qwen_key_if_using_API"
+  mistral: "Your_mistral_key_if_using_API"
+
+# Agents (To add an agent, define it here and route to/from it below)
+agents:
+  - id: social_analyst # Give a unique ID
+    role: analyst # Role of agent: analyst/coordinator/controller/executor
+    prompt_id: analyst_social # Give a unique prompt ID to map to prompts.yaml
+    inputs:
+      - source: social      
+        window: {days: 4}
+        select: {by: sentiment, top_k: 15, mode: per_asset} # Select by sentiment or recency
+    llm:
+      provider: openai    # openai || ollama || hf || mistral  
+      model: gpt-4o-mini # gpt-4o-mini || Llama-3.1-8B-Instruct
+      temperature: 0.0
+
+  - id: coordinator
+    role: coordinator
+    prompt_id: coordinator_fuse
+    llm:
+      provider: openai        
+      model: gpt-4o-mini
+      temperature: 0.0
+
+  - id: controller
+    role: controller
+    prompt_id: controller_risk
+    llm:
+      provider: openai         
+      model: gpt-4o-mini
+      temperature: 0.0
+
+  - id: executor
+    role: executor
+    prompt_id: executor_trade
+    llm:
+      provider: openai         
+      model: gpt-4o-mini
+      temperature: 0.0
+
+# Routing (Make sure to route all agents to/from others here)
+routing:
+  - src: social_analyst
+    dst: coordinator
+  - src: coordinator
+    dst: controller
+  - src: controller
+    dst: executor
+
+attack:
+  llm:
+    provider: openai
+    model: gpt-4o-mini
+    temperature: 0.7
