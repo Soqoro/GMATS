@@ -196,7 +196,8 @@ class LLMAgent:
                     for rec in extras:
                         rdate = str(rec.get("date") or cur)
                         text = rec.get("tweet") or rec.get("text") or ""
-                        rid = _hash_id("synthetic", sym, rdate, text)
+                        # >>> changed: preserve overlay-provided id if present; else fall back to hashed synthetic id
+                        rid = str(rec.get("id")) if rec.get("id") else _hash_id("synthetic", sym, rdate, text)
                         if rid in seen_ids:
                             continue
                         seen_ids.add(rid)
