@@ -71,12 +71,41 @@ def _collect_ranked_ids(logs: Dict[str, Dict[str, List[dict]]]) -> Set[str]:
             out.update([str(x) for x in ev.get("ranked_ids", [])])
     return out
 
+# ---- NEW: helper to pull all relevant id fields from a manifest record ----
+def _pull_ids_from_manifest_obj(obj: Any) -> List[str]:
+    """
+    Accepts either a string ID or a dict that may contain multiple aliases.
+    Known keys: id, message_id, attk_id, overlay_id, raw_id, alt_id, ids(list).
+    """
+    out: List[str] = []
+    if isinstance(obj, str):
+        s = obj.strip()
+        if s:
+            out.append(s)
+        return out
+
+    if isinstance(obj, dict):
+        # single-value fields
+        for key in ("id", "message_id", "attk_id", "overlay_id", "raw_id", "alt_id"):
+            val = obj.get(key)
+            if isinstance(val, str) and val.strip():
+                out.append(val.strip())
+        # list-style field
+        ids_list = obj.get("ids")
+        if isinstance(ids_list, list):
+            for v in ids_list:
+                if isinstance(v, str) and v.strip():
+                    out.append(v.strip())
+                elif isinstance(v, dict):
+                    out.extend(_pull_ids_from_manifest_obj(v))
+    return out
+
 def _load_poison_ids(path: str | None,
                      attack_logs: Dict[str, Dict[str, List[dict]]],
                      clean_logs: Dict[str, Dict[str, List[dict]]]) -> Set[str]:
     """
     Poison set priority:
-      1) explicit manifest (json/jsonl: strings or {id: ...})
+      1) explicit manifest (json/jsonl: strings or dicts with id/aliases)
       2) inferred: (attack consumed ids) - (clean consumed ids)
       3) fallback: (attack ranked ids) - (clean ranked ids)
     """
@@ -91,11 +120,12 @@ def _load_poison_ids(path: str | None,
                         continue
                     try:
                         obj = json.loads(line)
-                        rid = obj.get("id") or obj.get("message_id") or (obj if isinstance(obj, str) else None)
-                        if rid:
-                            P.add(str(rid))
                     except Exception:
+                        # if a raw string line (rare), keep as-is
+                        P.add(line)
                         continue
+                    for rid in _pull_ids_from_manifest_obj(obj):
+                        P.add(str(rid))
         else:
             try:
                 obj = json.load(open(path, "r", encoding="utf-8"))
@@ -103,10 +133,12 @@ def _load_poison_ids(path: str | None,
                 obj = []
             if isinstance(obj, list):
                 for x in obj:
-                    if isinstance(x, str):
-                        P.add(x)
-                    elif isinstance(x, dict) and x.get("id"):
-                        P.add(str(x["id"]))
+                    for rid in _pull_ids_from_manifest_obj(x):
+                        P.add(str(rid))
+            elif isinstance(obj, dict):
+                # also support a dict with a top-level "ids" list
+                for rid in _pull_ids_from_manifest_obj(obj):
+                    P.add(str(rid))
         return P
 
     # 2) consumed diff
