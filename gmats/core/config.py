@@ -30,6 +30,8 @@ class Config:
     schedule: Dict[str, str]
     llm: Dict[str, Any]
     prompts_file: Optional[str] = None
+    llm_keys: Dict[str, str] = field(default_factory=dict)  # NEW
+    attack: Dict[str, Any] = field(default_factory=dict)    # NEW
 
 def load_yaml(path: str) -> Dict[str, Any]:
     with open(path, "r", encoding="utf-8") as f:
@@ -76,4 +78,6 @@ def load_config(path: str) -> Config:
         schedule=raw.get("schedule", {}),
         llm=raw.get("llm", {}),
         prompts_file=prompts_file,
+        llm_keys=raw.get("llm_keys", {}) or {},   # NEW
+        attack=raw.get("attack", {}) or {},       # NEW
     )
