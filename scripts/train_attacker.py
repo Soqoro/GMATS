@@ -13,6 +13,7 @@ from stable_baselines3.common.monitor import Monitor
 
 from gmats.attack.rl_env import RLAttackEnv
 from gmats.attack.gym_env import GymAttackEnv
+from gmats.attack.reward_wrappers import AttackRewardMixer
 
 def main():
     ap = argparse.ArgumentParser()
@@ -23,7 +24,17 @@ def main():
 
     # 1) Core env + Gym wrapper
     core = RLAttackEnv(args.config, args.data_root)
-    env = GymAttackEnv(core)
+    base_env = GymAttackEnv(core)
+
+    env = AttackRewardMixer(
+        base_env,
+        topk=10,            # IR@10
+        alpha=0.5,          # weight for IR@k
+        beta=0.25,          # weight for IACR (if provided)
+        c_post=1e-3,        # cost per synthetic post
+        eta=0.1,            # penalty weight for risk beyond delta
+        risk_tol=0.5,       # tolerated detection risk
+    )
     env = Monitor(env)  # logs episode returns/lengths
 
     # 2) TD3 config

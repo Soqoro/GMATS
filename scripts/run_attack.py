@@ -9,8 +9,8 @@ import numpy as np
 from stable_baselines3 import TD3
 
 from gmats.attack.rl_env import RLAttackEnv
-from gmats.attack.gym_env import GymAttackEnv  # wrapper we added earlier
-
+from gmats.attack.gym_env import GymAttackEnv
+from gmats.attack.reward_wrappers import AttackRewardMixer
 
 def main():
     ap = argparse.ArgumentParser()
@@ -45,7 +45,17 @@ def main():
             f.write("date,equity,pnl,label,lev,a_sent,orders_json\n")
 
     core = RLAttackEnv(args.config, args.data_root)
-    env = GymAttackEnv(core)
+    base_env = GymAttackEnv(core)
+
+    env = AttackRewardMixer(
+        base_env,
+        topk=10,            # IR@10
+        alpha=0.5,          # weight for IR@k
+        beta=0.25,          # weight for IACR (if provided)
+        c_post=1e-3,        # cost per synthetic post
+        eta=0.1,            # penalty weight for risk beyond delta
+        risk_tol=0.5,       # tolerated detection risk
+    )
 
     model = TD3.load(args.model, env=env, print_system_info=False)
 

@@ -11,6 +11,8 @@ class AttackOverlay:
     def __init__(self):
         # _buf[date_str][ASSET] -> [post, ...]
         self._buf: Dict[str, Dict[str, List[dict]]] = defaultdict(lambda: defaultdict(list))
+        # NEW: initialize bias map (you already call set_bias/get_bias)
+        self._bias: Dict[str, Dict[str, Tuple[float, float]]] = defaultdict(dict)
 
     def inject(self, *, date: str, asset: str, post: dict) -> None:
         """Insert a single synthetic post for (date, asset)."""
@@ -42,6 +44,14 @@ class AttackOverlay:
         """Remove all injected posts on `date` (optional utility)."""
         self._buf.pop(date, None)
 
+    def get_ids_for_date(self, date: str) -> List[str]:
+        out: List[str] = []
+        for posts in self._buf.get(date, {}).values():
+            for p in posts:
+                pid = p.get("id")
+                if isinstance(pid, str) and pid:
+                    out.append(pid)
+        return out
 
 # ---------- Module-level global registry (so agents can find the overlay) ----------
 _GLOBAL_OVERLAY = None
