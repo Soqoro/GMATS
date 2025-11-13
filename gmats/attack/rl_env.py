@@ -29,9 +29,11 @@ class RLAttackEnv:
         self.data = GMATSDataset(data_root, market_dir=self.cfg.data["market_dir"])
         self.assets = [s.upper() for s in self.cfg.assets]
 
+        # Attack overlay (active in attack path only)
         self.overlay = AttackOverlay()
         set_global_overlay(self.overlay)
 
+        # Attack strategy (uses overlay)
         self.strategy = GMATSLLMStrategy(
             config_path=config_path,
             data_root=data_root,
@@ -39,6 +41,17 @@ class RLAttackEnv:
         )
         try:
             self.strategy.social.overlay = self.overlay  # type: ignore[attr-defined]
+        except Exception:
+            pass
+
+        # Clean strategy (no overlay)
+        self.strategy_clean = GMATSLLMStrategy(
+            config_path=config_path,
+            data_root=data_root,
+            log_dates=True
+        )
+        try:
+            self.strategy_clean.social.overlay = None  # type: ignore[attr-defined]
         except Exception:
             pass
 
@@ -65,11 +78,8 @@ class RLAttackEnv:
                 "model": os.getenv("ATTACK_LLM_MODEL", ""),
                 "temperature": float(os.getenv("ATTACK_LLM_TEMPERATURE", "0.0")),
             }
-            # OpenAI-compatible base URL (vLLM, llama.cpp server, Ollama /v1, etc.)
             if os.getenv("ATTACK_LLM_BASE_URL"): acfg["base_url"] = os.getenv("ATTACK_LLM_BASE_URL")
-            # Ollama python client host (if using provider="ollama")
             if os.getenv("ATTACK_LLM_HOST"): acfg["host"] = os.getenv("ATTACK_LLM_HOST")
-            # HF options
             if os.getenv("ATTACK_LLM_DEVICE"): acfg["device"] = os.getenv("ATTACK_LLM_DEVICE")
             if os.getenv("ATTACK_LLM_DTYPE"): acfg["dtype"] = os.getenv("ATTACK_LLM_DTYPE")
             if os.getenv("ATTACK_LLM_TRUST_REMOTE_CODE"):
@@ -96,7 +106,6 @@ class RLAttackEnv:
         try:
             agents = list(getattr(self.cfg, "agents", []) or [])
             if agents:
-                # Agents are AgentSpec; llm block is preserved in params
                 first = agents[0]
                 if isinstance(first, AgentSpec):
                     first_llm = (first.params or {}).get("llm")
@@ -134,14 +143,85 @@ class RLAttackEnv:
             common = common[:-1]
         return common
 
+    # ---------------- Introspection helpers ----------------
+    @staticmethod
+    def _iter_events_from_strategy(strategy: Any):
+        """
+        Best-effort: find emitted events with payloads.
+        Tries common attributes used by logging utilities.
+        """
+        # strategy.logger.buffer (preferred)
+        try:
+            buf = getattr(getattr(strategy, "logger", None), "buffer", None)
+            if isinstance(buf, list):
+                for ev in buf:
+                    if isinstance(ev, dict):
+                        yield ev
+        except Exception:
+            pass
+        # fallbacks
+        for name in ("_events", "events", "last_events", "emitted", "log_buffer"):
+            try:
+                evs = getattr(strategy, name, None)
+                if isinstance(evs, list):
+                    for ev in evs:
+                        if isinstance(ev, dict):
+                            yield ev
+            except Exception:
+                pass
+
+    @classmethod
+    def _latest_scorecard_for_agent(cls, strategy: Any, agent_id: str) -> Optional[List[dict]]:
+        sc = None
+        for ev in cls._iter_events_from_strategy(strategy):
+            if ev.get("kind") == "agent_out" and ev.get("agent_id") == agent_id:
+                payload = ev.get("payload_json")
+                if isinstance(payload, dict) and isinstance(payload.get("scorecard"), list):
+                    sc = payload["scorecard"]
+        return sc
+
+    @classmethod
+    def _latest_ingested_ids(cls, strategy: Any) -> Optional[List[str]]:
+        """
+        Return last 'consumed_ids' (or 'ranked_ids') from social_analyst ingestion.
+        """
+        ids = None
+        for ev in cls._iter_events_from_strategy(strategy):
+            if ev.get("kind") == "ingestion" and ev.get("agent_id") == "social_analyst":
+                # prefer consumed_ids
+                lst = ev.get("consumed_ids")
+                if isinstance(lst, list) and lst:
+                    ids = [str(x) for x in lst]
+                else:
+                    lst = ev.get("ranked_ids")
+                    if isinstance(lst, list) and lst:
+                        ids = [str(x) for x in lst]
+        return ids
+
+    @staticmethod
+    def _score_for_symbol(scorecard: Optional[List[dict]], sym: str) -> Optional[dict]:
+        if not isinstance(scorecard, list):
+            return None
+        S = sym.upper()
+        for r in scorecard:
+            if isinstance(r, dict) and str(r.get("symbol", "")).upper() == S:
+                return r
+        return None
+
     # ---------------- API ----------------
     def reset(self) -> Dict[str, Any]:
+        # reset overlays
         self.overlay = AttackOverlay()
         set_global_overlay(self.overlay)
         try:
             self.strategy.social.overlay = self.overlay  # type: ignore[attr-defined]
         except Exception:
             pass
+        try:
+            self.strategy_clean.social.overlay = None  # type: ignore[attr-defined]
+        except Exception:
+            pass
+
         self._t = 0
         self._equity = 1.0
         self._prev_orders = []
@@ -227,10 +307,10 @@ class RLAttackEnv:
                 "text": post["text"],
             })
 
-        # 2) Run GMATS per asset
+        # 2) Run GMATS per asset — ATTACK path
         lev = float(np.clip(1.0 + TRADE_GAIN * float(a_trade), 0.0, 2.0))
         orders_eff: List[Dict[str, Any]] = []
-        pnl = 0.0
+        pnl_attack = 0.0
 
         for sym in self.assets:
             orders_sym = self.strategy.decide_for_date(date, [sym])
@@ -240,13 +320,42 @@ class RLAttackEnv:
                 w_eff = float(np.clip(w * lev, -1.0, 1.0))
                 orders_eff.append({"symbol": s, "weight": w_eff})
                 ret = self.data.get_next_day_return(s, date)
-                pnl += w_eff * ret
+                pnl_attack += w_eff * ret
 
-        # 3) Update equity / info
-        next_equity = self._equity * (1.0 + pnl)
-        r = next_equity - self._equity
+        # Capture attack scorecards & ingested ids (best effort)
+        analyst_sc_attack = self._latest_scorecard_for_agent(self.strategy, "social_analyst")
+        coord_sc_attack   = self._latest_scorecard_for_agent(self.strategy, "coordinator")
+        ingested_ids_attack = self._latest_ingested_ids(self.strategy)
+
+        # 3) Run GMATS per asset — CLEAN path (no overlay, no leverage)
+        # Temporarily disable global overlay to ensure clean run ignores injections
+        set_global_overlay(None)
+        try:
+            pnl_clean = 0.0
+            orders_clean_eff: List[Dict[str, Any]] = []
+            for sym in self.assets:
+                orders_sym = self.strategy_clean.decide_for_date(date, [sym])
+                for o in orders_sym:
+                    s = o["symbol"].upper()
+                    w = float(o.get("weight", 0.0))
+                    w_eff = float(np.clip(w * 1.0, -1.0, 1.0))  # lev_clean = 1.0 (attacker absent)
+                    orders_clean_eff.append({"symbol": s, "weight": w_eff})
+                    ret = self.data.get_next_day_return(s, date)
+                    pnl_clean += w_eff * ret
+            # Capture clean scorecards
+            analyst_sc_clean = self._latest_scorecard_for_agent(self.strategy_clean, "social_analyst")
+            coord_sc_clean   = self._latest_scorecard_for_agent(self.strategy_clean, "coordinator")
+        finally:
+            # Restore global overlay for future steps
+            set_global_overlay(self.overlay)
+
+        # 4) Update equity / info (attack path is the one actually “executed”)
+        next_equity = self._equity * (1.0 + pnl_attack)
+        r_attack = next_equity - self._equity
         self._equity = next_equity
-        info = {
+
+        # Build info for reward wrapper (includes everything needed for IR@k + BSS)
+        info: Dict[str, Any] = {
             "orders": orders_eff,
             "label": label,
             "equity": self._equity,
@@ -254,16 +363,45 @@ class RLAttackEnv:
             "a_trade": float(a_trade),
             "a_sent": float(a_sent),
             "lev": lev,
+            # --- perf delta support ---
+            "pnl_clean": float(pnl_clean),
+            # --- symbols for BSS symbol disambiguation ---
+            "symbols": self.assets[:],  # reward wrapper will pick the first if needed
+            # --- IR@k support ---
+            "ingested_topk_ids": ingested_ids_attack or [],
+            # Expose attack post IDs for matching:
+            "attack_posts": [{"id": x["attk_id"], "symbol": x["symbol"], "date": x["date"]} for x in injected],
+            # --- scorecards for BSS (analyst + coordinator) ---
+            "analyst_attack_scorecard": analyst_sc_attack or [],
+            "analyst_clean_scorecard": analyst_sc_clean or [],
+            "coordinator_attack_scorecard": coord_sc_attack or [],
+            "coordinator_clean_scorecard": coord_sc_clean or [],
         }
+
+        # Also include convenience top-level mus for the first symbol (if discoverable)
+        try:
+            sym0 = self.assets[0]
+            ra = self._score_for_symbol(analyst_sc_attack, sym0) or {}
+            rc = self._score_for_symbol(analyst_sc_clean, sym0) or {}
+            ka = self._score_for_symbol(coord_sc_attack, sym0) or {}
+            kc = self._score_for_symbol(coord_sc_clean, sym0) or {}
+            if "mu" in ra and "mu" in rc:
+                info["analyst_mu_attack"] = float(ra.get("mu"))
+                info["analyst_mu_clean"] = float(rc.get("mu"))
+            if "mu" in ka and "mu" in kc:
+                info["coordinator_mu_attack"] = float(ka.get("mu"))
+                info["coordinator_mu_clean"] = float(kc.get("mu"))
+        except Exception:
+            pass
 
         self._prev_orders = orders_eff[-10:]
 
-        # 4) Advance day
+        # 5) Advance day
         self._t += 1
         done = (self._t >= len(self.dates))
         if done:
-            return {}, r, True, info
+            return {}, float(r_attack), True, info
 
-        # 5) Next observation
+        # 6) Next observation
         obs_next = self._observe()
-        return obs_next, r, False, info
+        return obs_next, float(r_attack), False, info

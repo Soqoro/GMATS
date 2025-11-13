@@ -12,13 +12,35 @@ from gmats.attack.rl_env import RLAttackEnv
 from gmats.attack.gym_env import GymAttackEnv
 from gmats.attack.reward_wrappers import AttackRewardMixer
 
+def make_wrapped_env(config_path, data_root, *, topk, alpha, beta_a, beta_c, reward_clip):
+    core = RLAttackEnv(config_path, data_root)
+    base_env = GymAttackEnv(core)
+    env = AttackRewardMixer(
+        base_env,
+        topk=topk,                 # IR@k
+        alpha=alpha,               # weight for IR@k
+        beta_analyst=beta_a,       # weight for BSS (analyst)
+        beta_coordinator=beta_c,   # weight for BSS (coordinator)
+        reward_clip=reward_clip,   # optional: None or a positive float
+    )
+    return env, core
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default="configs/gmats.yaml")
     ap.add_argument("--data_root", default="./data")
     ap.add_argument("--model", default="td3_attacker.zip")
     ap.add_argument("--out_dir", default="results/attack")
+
+    # reward shaping knobs (keep aligned with training)
+    ap.add_argument("--topk", type=int, default=10)
+    ap.add_argument("--alpha", type=float, default=0.5)
+    ap.add_argument("--beta_analyst", type=float, default=0.25)
+    ap.add_argument("--beta_coordinator", type=float, default=0.25)
+    ap.add_argument("--reward_clip", type=float, default=0.0, help="0 or negative to disable")
+
     args = ap.parse_args()
+    reward_clip = args.reward_clip if args.reward_clip > 0 else None
 
     # --- ensure output + GMATS per-asset logging mirror clean run ---
     os.makedirs(args.out_dir, exist_ok=True)
@@ -31,30 +53,31 @@ def main():
 
     # poison manifest path (deterministic IDs emitted by env->info["injected"])
     manifest_path = os.path.join(args.out_dir, "poison_ids.jsonl")
-    with open(manifest_path, "w", encoding="utf-8") as _mf:
+    with open(manifest_path, "w", encoding="utf-8"):
         pass  # truncate
 
     # results dir
     results_dir = os.path.join(args.out_dir, "results")
     os.makedirs(results_dir, exist_ok=True)
 
-    # daily telemetry CSV
+    # daily telemetry CSV (kept for backward-compat; note: 'pnl' column stores SHAPED reward)
     results_csv = os.path.join(results_dir, "attack_results.csv")
     if not os.path.exists(results_csv):
         with open(results_csv, "w", encoding="utf-8") as f:
             f.write("date,equity,pnl,label,lev,a_sent,orders_json\n")
 
-    core = RLAttackEnv(args.config, args.data_root)
-    base_env = GymAttackEnv(core)
+    # reward-term breakdown JSONL (new, helpful for debugging)
+    terms_jsonl = os.path.join(results_dir, "attack_reward_terms.jsonl")
+    with open(terms_jsonl, "w", encoding="utf-8"):
+        pass  # truncate
 
-    env = AttackRewardMixer(
-        base_env,
-        topk=10,            # IR@10
-        alpha=0.5,          # weight for IR@k
-        beta=0.25,          # weight for IACR (if provided)
-        c_post=1e-3,        # cost per synthetic post
-        eta=0.1,            # penalty weight for risk beyond delta
-        risk_tol=0.5,       # tolerated detection risk
+    env, core = make_wrapped_env(
+        args.config, args.data_root,
+        topk=args.topk,
+        alpha=args.alpha,
+        beta_a=args.beta_analyst,
+        beta_c=args.beta_coordinator,
+        reward_clip=reward_clip,
     )
 
     model = TD3.load(args.model, env=env, print_system_info=False)
@@ -76,7 +99,7 @@ def main():
         # per-day JSON log entry
         row = {
             "date": cur_date,
-            "reward": float(r),
+            "reward": float(r),                           # shaped reward
             "equity": float(info.get("equity", np.nan)),
             "label": info.get("label"),
             "orders": info.get("orders", []),
@@ -85,6 +108,13 @@ def main():
             "lev": info.get("lev"),
         }
         logs.append(row)
+
+        # ---- reward terms (optional but useful)
+        terms = info.get("attack_reward_terms", {})
+        if terms:
+            terms_row = {"date": cur_date, **terms}
+            with open(terms_jsonl, "a", encoding="utf-8") as tf:
+                tf.write(json.dumps(terms_row) + "\n")
 
         # ---- update per-ticker equity from today's orders
         for od in row["orders"]:
@@ -110,7 +140,7 @@ def main():
                 for prow in injected:
                     mf.write(json.dumps(prow) + "\n")
 
-        # append daily telemetry row
+        # append daily telemetry row (keeps legacy header)
         with open(results_csv, "a", encoding="utf-8") as f:
             f.write(
                 f"{cur_date},{row['equity']},{float(r)},{row['label']},"
@@ -120,7 +150,7 @@ def main():
         if terminated or truncated:
             break
 
-    # Save per-day log
+    # Save per-day log (compact JSONL of a few fields)
     with open(os.path.join(args.out_dir, "attack_log.jsonl"), "w", encoding="utf-8") as f:
         for rrow in logs:
             f.write(json.dumps(rrow) + "\n")
@@ -204,7 +234,7 @@ def main():
             ann = 252
             total_return = eq_series[-1] - 1.0
             annual_return = (np.prod([1.0 + r for r in rets]) ** (ann / max(N, 1))) - 1.0 if N > 0 else 0.0
-            daily_std = _std(rets)
+            daily_std = float(np.std(rets, ddof=1)) if len(rets) > 1 else 0.0
             annual_vol = daily_std * np.sqrt(ann)
             mean_ret = float(np.mean(rets)) if N > 0 else 0.0
             sharpe = (mean_ret / daily_std * np.sqrt(ann)) if daily_std > 0 else 0.0
@@ -237,7 +267,7 @@ def main():
     print(f"[ATTACK] Logs dir: {log_dir}")
     print(f"[ATTACK] Poison manifest: {manifest_path}")
     print(f"[ATTACK] Results CSV: {results_csv}")
-
+    print(f"[ATTACK] Reward-term breakdown: {terms_jsonl}")
 
 if __name__ == "__main__":
     main()
