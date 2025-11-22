@@ -1,4 +1,3 @@
-# gmats/agents/llm_agent.py
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Set
@@ -10,7 +9,8 @@ from gmats.attack.overlay import get_global_overlay  # merge synthetic posts
 
 LOGGER = logging.getLogger(__name__)
 
-# Strict routing: ONLY the analyst may ingest social unless explicitly allowed
+# Strict routing: only agents that explicitly declare SOCIAL input may ingest social.
+# Analysts are allowed by default; non-analysts must be explicitly enabled via GMATS_ALLOW_NONANALYST_SOCIAL.
 ALLOW_NONANALYST_SOCIAL = os.getenv("GMATS_ALLOW_NONANALYST_SOCIAL", "0").lower() in ("1", "true", "yes")
 
 # ---------------------------
@@ -196,7 +196,7 @@ class LLMAgent:
                     for rec in extras:
                         rdate = str(rec.get("date") or cur)
                         text = rec.get("tweet") or rec.get("text") or ""
-                        # >>> changed: preserve overlay-provided id if present; else fall back to hashed synthetic id
+                        # preserve overlay-provided id if present; else fall back to hashed synthetic id
                         rid = str(rec.get("id")) if rec.get("id") else _hash_id("synthetic", sym, rdate, text)
                         if rid in seen_ids:
                             continue
@@ -274,18 +274,22 @@ class LLMAgent:
         date_str = str(date)
         assets = assets or []
         inbox = inbox or []
-        win_days, by, top_k, mode = self._parse_rag_spec()
-        # Strict routing gate here too
-        if (self.role == "analyst") or (ALLOW_NONANALYST_SOCIAL and self._social_input_enabled()):
+
+        # Defaults when SOCIAL is disabled
+        win_days, by, top_k, mode = 0, "none", 0, "none"
+        selected: List[Dict[str, Any]] = []
+        ranked_all: List[Dict[str, Any]] = []
+
+        if self._social_enabled():
+            win_days, by, top_k, mode = self._parse_rag_spec()
             window_posts = self._load_social_window(date_str, assets)
             selected, ranked_all = self._rank_social(window_posts, by, int(top_k), mode, assets)
-        else:
-            selected, ranked_all = [], []
+
         return {
             "DATE": date_str,
             "ASSETS": assets,
             "INBOX_MESSAGES": inbox,
-            "SOCIAL_POSTS": selected,         # Top-k actually consumed (analyst only)
+            "SOCIAL_POSTS": selected,         # Top-k actually consumed
             "_RAG_WINDOW_ALL": ranked_all,    # For logging only
             "_RAG_SPEC": {"days": win_days, "by": by, "top_k": top_k, "mode": mode},
         }
@@ -300,16 +304,29 @@ class LLMAgent:
                 continue
         return False
 
+    def _social_enabled(self) -> bool:
+        """
+        Should this agent ingest SOCIAL posts at all?
+
+        Policy:
+          - Must explicitly declare a SOCIAL input (source: "social").
+          - Analysts are allowed by default.
+          - Non-analysts only if GMATS_ALLOW_NONANALYST_SOCIAL is true.
+        """
+        has_social = self._social_input_enabled()
+        if not has_social:
+            return False
+        if self.role == "analyst":
+            return True
+        return ALLOW_NONANALYST_SOCIAL
+
     def run(self, date, assets=None, inbox=None, downstream_ids=None):
         date_str = str(getattr(date, "isoformat", lambda: date)())
         assets = [str(a).upper() for a in (assets or [])]
         inbox_msgs = inbox or []
 
-        # STRICT: only analyst may ingest social unless explicitly allowed
-        social_enabled = (
-            (self.role == "analyst") or
-            (ALLOW_NONANALYST_SOCIAL and self._social_input_enabled())
-        )
+        # STRICT: only agents that explicitly declare SOCIAL input may ingest social.
+        social_enabled = self._social_enabled()
 
         # Build prompt vars
         vars: Dict[str, Any] = {
@@ -318,7 +335,7 @@ class LLMAgent:
             "INBOX_MESSAGES": inbox_msgs,
         }
 
-        # Load and rank SOCIAL only if enabled (analyst by default)
+        # Load and rank SOCIAL only if enabled
         consumed: List[Dict[str, Any]] = []
         ranked_all: List[Dict[str, Any]] = []
         if social_enabled:
@@ -354,7 +371,7 @@ class LLMAgent:
             except Exception:
                 LOGGER.debug("Failed to write ingestion log for %s", self.id)
 
-        # Render prompt from template (SOCIAL omitted for non-analyst)
+        # Render prompt from template (SOCIAL omitted when disabled)
         tpl = self.prompt.get("template", "") or ""
         prompt = (
             tpl
@@ -385,7 +402,7 @@ class LLMAgent:
                         "DATE": vars["DATE"],
                         "ASSETS": vars["ASSETS"],
                         "INBOX_MESSAGES": vars["INBOX_MESSAGES"],
-                        # Only include SOCIAL_POSTS when enabled (analyst by default)
+                        # Only include SOCIAL_POSTS when enabled
                         **({"SOCIAL_POSTS": vars["SOCIAL_POSTS"]} if social_enabled else {}),
                     },
                     "system": system,

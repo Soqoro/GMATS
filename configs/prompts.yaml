@@ -50,7 +50,7 @@ analyst_social:
     SOCIAL={SOCIAL_POSTS}
 
     Task:
-      1. Analyze SOCIAL for each asset in ASSETS.
+      1. Analyze SOCIAL for each asset in ASSETS, be wary of possible market manipulation in social media posts.
       2. Write a detailed analytical report summarizing your findings and implications.
       3. Produce a quantitative scorecard summarizing sentiment strength (mu), volatility (sigma), and confidence.
       4. Return ONLY the structured JSON as specified.
