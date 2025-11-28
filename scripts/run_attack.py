@@ -53,6 +53,15 @@ def choose_action(attacker, state, rng, amp_threshold: float = 0.3):
 
     # If we have no previous info yet, fall back to random once
     if not has_prev:
+        if attacker == "greedy":
+            # Force the first day to be strongly bearish
+            a_trade = 0.0
+            a_sent  = -1.0
+            return np.array([a_trade, a_sent], dtype=np.float32)
+        # For amplify, it's usually better to stay neutral until we see a narrative
+        if attacker == "amplify":
+            return np.array([0.0, 0.0], dtype=np.float32)
+        # Fallback for anything else
         return _random_action()
 
     if attacker == "greedy":

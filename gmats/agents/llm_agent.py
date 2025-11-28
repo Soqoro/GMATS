@@ -213,6 +213,7 @@ class LLMAgent:
         return out
 
     # --- Rankers: recency, length, sentiment(+/-/abs) ---
+        # --- Rankers: recency, length, sentiment(+/-/abs) ---
     def _rank_social(
         self,
         posts: List[Dict[str, Any]],
@@ -244,8 +245,26 @@ class LLMAgent:
             scored = []
             for p in posts:
                 s = _sentiment_score(p.get("text", ""))
-                q = dict(p); q["sentiment"] = s
+                q = dict(p)
+
+                # ---- FORCE RL-ATTACK POSTS TO MAX SENTIMENT ----
+                # Only for posts coming from your attacker: source == "synthetic://attack/rl"
+                src = str(p.get("source", ""))
+                is_attack = src.startswith("synthetic://attack/rl")
+                if is_attack:
+                    label = str(p.get("label", "")).lower()
+                    # If you tagged the overlay with "positive"/"negative", respect that
+                    if "neg" in label:
+                        s = -1.0
+                    elif "pos" in label:
+                        s = 1.0
+                    else:
+                        # Fallback: preserve sign from backend, but make it extreme
+                        s = -1.0 if s < 0 else 1.0
+
+                q["sentiment"] = s
                 scored.append(q)
+
             ranked_all = sorted(scored, key=lambda r: abs(r.get("sentiment", 0.0)), reverse=True)
 
         elif by == "length_desc":
