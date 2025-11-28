@@ -6,14 +6,14 @@ if ROOT not in sys.path:
 
 import argparse, json, csv
 import numpy as np
-from stable_baselines3 import TD3
 
 from gmats.attack.rl_env import RLAttackEnv
 from gmats.attack.gym_env import GymAttackEnv
 from gmats.attack.reward_wrappers import AttackRewardMixer
 
-def make_wrapped_env(config_path, data_root, *, topk, alpha, beta_a, beta_c, reward_clip):
-    core = RLAttackEnv(config_path, data_root)
+
+def make_wrapped_env(config_path, data_root, *, topk, alpha, beta_a, beta_c, reward_clip, posts_per_day: int = 1):
+    core = RLAttackEnv(config_path, data_root, posts_per_day=posts_per_day)
     base_env = GymAttackEnv(core)
     env = AttackRewardMixer(
         base_env,
@@ -25,14 +25,89 @@ def make_wrapped_env(config_path, data_root, *, topk, alpha, beta_a, beta_c, rew
     )
     return env, core
 
+
+def choose_action(attacker, state, rng, amp_threshold: float = 0.3):
+    """
+    Map attacker type + state to a continuous action [a_trade, a_sent] in [-1, 1]^2.
+
+    state fields (updated after each env.step):
+        has_prev: bool
+        prev_exposure: float   # approximate signed exposure to target asset
+        prev_mu: float         # approximate sentiment mu in [-1, 1]
+        prev_volume: float     # optional volume proxy (unused if not set)
+    """
+    # Fallback: pure random policy
+    def _random_action():
+        # a_trade=0 → no extra leverage; env trades at base size
+        a_trade = 0.0
+        a_sent  = float(rng.uniform(-1.0, 1.0))
+        return np.array([a_trade, a_sent], dtype=np.float32)
+
+    if attacker == "random":
+        return _random_action()
+
+    has_prev = state.get("has_prev", False)
+    exposure = float(state.get("prev_exposure", 0.0))
+    mu       = float(state.get("prev_mu", 0.0))
+    volume   = float(state.get("prev_volume", 1.0))
+
+    # If we have no previous info yet, fall back to random once
+    if not has_prev:
+        return _random_action()
+
+    if attacker == "greedy":
+        # Greedy victim-aware: lean against previous day's exposure.
+        if abs(exposure) < 1e-6:
+            # No clear exposure → stay neutral.
+            return np.array([0.0, 0.0], dtype=np.float32)
+        direction = -1.0 if exposure > 0.0 else 1.0  # push against long/short
+        a_trade = 0
+        a_sent  = direction  # let RLAttackEnv + quantizer map this to strong bull/bear labels
+        return np.array([a_trade, a_sent], dtype=np.float32)
+
+    if attacker == "amplify":
+        # Volume-amplifying: push in the direction of strong, high-volume sentiment.
+        strength = abs(mu) * max(volume, 1.0)
+        if strength < amp_threshold:
+            # Weak narrative → remain neutral.
+            return np.array([0.0, 0.0], dtype=np.float32)
+        direction = 1.0 if mu > 0.0 else -1.0
+        a_trade = 0
+        a_sent  = direction
+        return np.array([a_trade, a_sent], dtype=np.float32)
+
+    # Unknown attacker string → default to random
+    return _random_action()
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default="configs/gmats.yaml")
     ap.add_argument("--data_root", default="./data")
-    ap.add_argument("--model", default="td3_attacker.zip")
     ap.add_argument("--out_dir", default="results/attack")
 
-    # reward shaping knobs (keep aligned with training)
+    # attacker configuration
+    ap.add_argument(
+        "--attacker",
+        choices=["random", "greedy", "amplify"],
+        default="random",
+        help="scripted attacker policy: random | greedy (victim-aware) | amplify (volume-amplifying)",
+    )
+    ap.add_argument("--seed", type=int, default=0, help="RNG seed for scripted attackers")
+    ap.add_argument(
+        "--amp_threshold",
+        type=float,
+        default=0.3,
+        help="minimum |mu|*volume needed for the amplify attacker to post",
+    )
+    ap.add_argument(
+        "--budget",
+        type=int,
+        default=1,
+        help="integer number of attack posts per asset per day (B)",
+    )
+
+    # reward shaping knobs (still used for logging / diagnostics)
     ap.add_argument("--topk", type=int, default=10)
     ap.add_argument("--alpha", type=float, default=0.5)
     ap.add_argument("--beta_analyst", type=float, default=0.25)
@@ -41,6 +116,8 @@ def main():
 
     args = ap.parse_args()
     reward_clip = args.reward_clip if args.reward_clip > 0 else None
+
+    rng = np.random.default_rng(args.seed)
 
     # --- ensure output + GMATS per-asset logging mirror clean run ---
     os.makedirs(args.out_dir, exist_ok=True)
@@ -78,19 +155,33 @@ def main():
         beta_a=args.beta_analyst,
         beta_c=args.beta_coordinator,
         reward_clip=reward_clip,
+        posts_per_day=max(1, args.budget),
     )
-
-    model = TD3.load(args.model, env=env, print_system_info=False)
 
     obs, _ = env.reset()
     logs = []
 
     # --- per-ticker equity tracking (to write baseline-style rows per ticker)
     # state: {ticker: {"eq": float, "eq_series": [floats], "rets": [floats], "dates": [str]}}
-    per_ticker = {}
+    per_ticker: dict = {}
+
+    # --- attacker state (drives scripted policies) ---
+    attacker_state = {
+        "has_prev": False,
+        "prev_exposure": 0.0,
+        "prev_mu": 0.0,
+        "prev_volume": 1.0,
+    }
 
     while True:
-        action, _ = model.predict(obs, deterministic=True)
+        # Choose scripted action based on previous day's state
+        action = choose_action(
+            args.attacker,
+            attacker_state,
+            rng,
+            amp_threshold=args.amp_threshold,
+        )
+
         obs, r, terminated, truncated, info = env.step(action)
 
         # resolve current day for logging
@@ -132,6 +223,74 @@ def main():
             st["eq_series"].append(new_eq)
             st["rets"].append((new_eq / prev_eq) - 1.0 if prev_eq != 0 else w_eff * ret_sym)
             st["dates"].append(cur_date)
+
+        # ---- update attacker_state for next day ----
+        # Approximate exposure from today's orders on the first symbol (single-asset experiments).
+        target_sym = None
+        syms = info.get("symbols")
+        if isinstance(syms, list) and syms:
+            target_sym = str(syms[0]).upper()
+        elif isinstance(info.get("symbol"), (str, bytes)):
+            target_sym = str(info["symbol"]).upper()
+
+        net_w = 0.0
+        if target_sym:
+            for od in row["orders"]:
+                if str(od.get("symbol", "")).upper() == target_sym:
+                    try:
+                        net_w += float(od.get("weight", 0.0))
+                    except Exception:
+                        continue
+        attacker_state["prev_exposure"] = net_w
+
+        # Estimate sentiment mu for the target asset from any available scorecard.
+        # Prefer attack-side analyst scorecard; fall back to clean keys if present.
+        mu = None
+        if target_sym:
+            for key in (
+                "analyst_attack_scorecard",   # preferred: attack-side analyst μ
+                "social_clean_scorecard",
+                "analyst_clean_scorecard",
+                "clean_scorecard",
+            ):
+                rows = info.get(key)
+                if isinstance(rows, list):
+                    for rrow in rows:
+                        try:
+                            if str(rrow.get("symbol", "")).upper() != target_sym:
+                                continue
+                            if "mu" in rrow:
+                                mu = float(rrow["mu"])
+                                break
+                        except Exception:
+                            continue
+                    if mu is not None:
+                        break
+        attacker_state["prev_mu"] = mu if mu is not None else 0.0
+
+        # Volume proxy: if scorecard exposes 'n' or 'count', use that; otherwise 1.0
+        vol = 1.0
+        if target_sym:
+            for key in (
+                "analyst_attack_scorecard",   # preferred: attack-side analyst volume proxy
+                "social_clean_scorecard",
+                "analyst_clean_scorecard",
+                "clean_scorecard",
+            ):
+                rows = info.get(key)
+                if isinstance(rows, list):
+                    for rrow in rows:
+                        try:
+                            if str(rrow.get("symbol", "")).upper() != target_sym:
+                                continue
+                            if "n" in rrow:
+                                vol = max(vol, float(rrow["n"]))
+                            elif "count" in rrow:
+                                vol = max(vol, float(rrow["count"]))
+                        except Exception:
+                            continue
+        attacker_state["prev_volume"] = vol
+        attacker_state["has_prev"] = True
 
         # append to poison manifest
         injected = info.get("injected") or []
@@ -268,6 +427,7 @@ def main():
     print(f"[ATTACK] Poison manifest: {manifest_path}")
     print(f"[ATTACK] Results CSV: {results_csv}")
     print(f"[ATTACK] Reward-term breakdown: {terms_jsonl}")
+
 
 if __name__ == "__main__":
     main()

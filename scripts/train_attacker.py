@@ -60,8 +60,8 @@ def main():
     ap.add_argument("--checkpoint_dir", type=str, default="td3_attacker_ckpts")
     ap.add_argument("--best_model_dir", type=str, default="td3_attacker_best")
     ap.add_argument("--eval_logdir", type=str, default="td3_attacker_eval")
-    ap.add_argument("--eval_freq", type=int, default=10_000)
-    ap.add_argument("--save_freq", type=int, default=50_000)
+    ap.add_argument("--eval_freq", type=int, default=100)
+    ap.add_argument("--save_freq", type=int, default=100)
 
     # reproducibility
     ap.add_argument("--seed", type=int, default=0)

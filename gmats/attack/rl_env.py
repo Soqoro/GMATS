@@ -26,7 +26,7 @@ def _ingestion_id(sym: str, date: str, text: str) -> str:
 
 class RLAttackEnv:
     """
-    GMATS attack environment for RL-based attackers.
+    GMATS attack environment for RL-based or scripted attackers.
 
     This version is *contagion-aware*: in addition to price history, the
     observation vector exposes a small set of summary signals from the
@@ -34,9 +34,9 @@ class RLAttackEnv:
 
         - equity (attack path)
         - IR@k-style overlap between ingested ids and attack posts
-        - BSS_analyst (|mu_attack - mu_clean| for social_analyst)
-        - BSS_coordinator (|mu_attack - mu_clean| for coordinator)
-        - pnl_delta (pnl_attack - pnl_clean)
+        - BSS_analyst (env-level placeholder; real BSS now computed offline)
+        - BSS_coordinator (env-level placeholder; real BSS now computed offline)
+        - pnl_delta (here: pnl_attack - pnl_clean, with pnl_clean=0 → pnl_delta≈pnl_attack)
 
     Reward semantics:
         - Raw env reward r = per-step attacked PnL (sum of w_eff * return)
@@ -44,8 +44,10 @@ class RLAttackEnv:
         - AttackRewardMixer wraps this and does normalized shaping
     """
 
-    def __init__(self, config_path: str, data_root: str):
+    def __init__(self, config_path: str, data_root: str, posts_per_day: int = 1):
         self.config_path = config_path
+        self.data_root = data_root
+        self.posts_per_day = int(max(1, posts_per_day))
         self.cfg = load_config(config_path)
         self.data = GMATSDataset(data_root, market_dir=self.cfg.data["market_dir"])
         self.assets = [s.upper() for s in self.cfg.assets]
@@ -62,17 +64,6 @@ class RLAttackEnv:
         )
         try:
             self.strategy.social.overlay = self.overlay  # type: ignore[attr-defined]
-        except Exception:
-            pass
-
-        # Clean strategy (no overlay)
-        self.strategy_clean = GMATSLLMStrategy(
-            config_path=config_path,
-            data_root=data_root,
-            log_dates=True,
-        )
-        try:
-            self.strategy_clean.social.overlay = None  # type: ignore[attr-defined]
         except Exception:
             pass
 
@@ -291,10 +282,6 @@ class RLAttackEnv:
             self.strategy.social.overlay = self.overlay  # type: ignore[attr-defined]
         except Exception:
             pass
-        try:
-            self.strategy_clean.social.overlay = None  # type: ignore[attr-defined]
-        except Exception:
-            pass
 
         self._t = 0
         self._equity = 1.0
@@ -380,53 +367,54 @@ class RLAttackEnv:
     ) -> Tuple[Dict[str, Any], float, bool, Dict[str, Any]]:
         date = self.dates[self._t]
 
-        # 1) Inject ONE synthetic post per asset (use attack LLM when available)
+        # 1) Inject synthetic posts per asset (use attack LLM when available)
         label = to_label(a_sent)
         injected: List[Dict[str, Any]] = []
         for sym in self.assets:
-            post = render_attack_post(
-                date=date,
-                asset=sym,
-                label=label,
-                seed_key=seed_key,
-                cfg_path=self.config_path,
-                orders_window=self._prev_orders,
-                llm=self.attack_llm,  # <-- THIS IS THE HOOK
-            )
-
-            txt = (post.get("text") or "").strip()
-            if not txt:
-                txt = (
-                    f"Note: ${sym} mixed signals into close. "
-                    f"#{label.replace(' ', '_')}"
+            for b in range(self.posts_per_day):
+                post = render_attack_post(
+                    date=date,
+                    asset=sym,
+                    label=label,
+                    seed_key=f"{seed_key}|{b}",   # keep IDs deterministic per-B
+                    cfg_path=self.config_path,
+                    orders_window=self._prev_orders,
+                    llm=self.attack_llm,
                 )
-                post["text"] = txt
 
-            pid = post.get("id")
-            if not pid:
-                pid = (
-                    "atk_"
-                    + hashlib.md5(
-                        f"{date}|{sym}|{label}|{seed_key}".encode("utf-8")
-                    ).hexdigest()[:12]
+                txt = (post.get("text") or "").strip()
+                if not txt:
+                    txt = (
+                        f"Note: ${sym} mixed signals into close. "
+                        f"#{label.replace(' ', '_')}"
+                    )
+                    post["text"] = txt
+
+                pid = post.get("id")
+                if not pid:
+                    pid = (
+                        "atk_"
+                        + hashlib.md5(
+                            f"{date}|{sym}|{label}|{seed_key}|{b}".encode("utf-8")
+                        ).hexdigest()[:12]
+                    )
+                    post["id"] = pid
+
+                log_id = _ingestion_id(sym, date, post["text"])
+                self.overlay.inject(date=date, asset=sym, post=post)
+
+                injected.append(
+                    {
+                        "date": date,
+                        "symbol": sym,
+                        "id": log_id,
+                        "attk_id": pid,
+                        "label": label,
+                        "text": post["text"],
+                    }
                 )
-                post["id"] = pid
 
-            log_id = _ingestion_id(sym, date, post["text"])
-            self.overlay.inject(date=date, asset=sym, post=post)
-
-            injected.append(
-                {
-                    "date": date,
-                    "symbol": sym,
-                    "id": log_id,
-                    "attk_id": pid,
-                    "label": label,
-                    "text": post["text"],
-                }
-            )
-
-        # 2) Run GMATS per asset — ATTACK path
+        # 2) Run GMATS per asset — ATTACK path only
         lev = float(np.clip(1.0 + TRADE_GAIN * float(a_trade), 0.0, 2.0))
         orders_eff: List[Dict[str, Any]] = []
         pnl_attack = 0.0
@@ -448,38 +436,12 @@ class RLAttackEnv:
         coord_sc_attack = self._latest_scorecard_for_agent(self.strategy, "coordinator")
         ingested_ids_attack = self._latest_ingested_ids(self.strategy)
 
-        # 3) Run GMATS per asset — CLEAN path (no overlay, no leverage)
-        # Temporarily disable global overlay to ensure clean run ignores injections
-        set_global_overlay(None)
-        try:
-            pnl_clean = 0.0
-            orders_clean_eff: List[Dict[str, Any]] = []
-            for sym in self.assets:
-                orders_sym = self.strategy_clean.decide_for_date(date, [sym])
-                for o in orders_sym:
-                    s = o["symbol"].upper()
-                    w = float(o.get("weight", 0.0))
-                    w_eff = float(np.clip(w * 1.0, -1.0, 1.0))  # lev_clean = 1.0
-                    orders_clean_eff.append({"symbol": s, "weight": w_eff})
-                    ret = self.data.get_next_day_return(s, date)
-                    pnl_clean += w_eff * ret
-            # Capture clean scorecards
-            analyst_sc_clean = self._latest_scorecard_for_agent(
-                self.strategy_clean, "social_analyst"
-            )
-            coord_sc_clean = self._latest_scorecard_for_agent(
-                self.strategy_clean, "coordinator"
-            )
-        finally:
-            # Restore global overlay for future steps
-            set_global_overlay(self.overlay)
-
-        # 4) Update equity / perf terms (attack path is the one actually “executed”)
-        # Use per-step attacked PnL as the raw env reward; equity is tracked separately.
+        # 3) No internal CLEAN path: treat clean PnL as 0.0 for env-level logging
         pnl_attack = float(pnl_attack)
-        pnl_clean = float(pnl_clean)
-        pnl_delta = float(pnl_attack - pnl_clean)
+        pnl_clean = 0.0
+        pnl_delta = float(pnl_attack - pnl_clean)  # == pnl_attack
 
+        # Update equity using attacked PnL (this is the executed path)
         next_equity = self._equity * (1.0 + pnl_attack)
         equity_delta = next_equity - self._equity
         self._equity = next_equity
@@ -487,28 +449,27 @@ class RLAttackEnv:
         # IR@k-style overlap for this step
         ir_k, ir_num, ir_den = self._compute_ir_k(ingested_ids_attack, injected)
 
-        # Convenience top-level mus for the first symbol (if discoverable)
+        # Convenience top-level mus for the first symbol (ATTACK only)
         analyst_mu_attack = None
-        analyst_mu_clean = None
         coord_mu_attack = None
-        coord_mu_clean = None
         try:
             sym0 = self.assets[0]
             ra = self._score_for_symbol(analyst_sc_attack, sym0) or {}
-            rc = self._score_for_symbol(analyst_sc_clean, sym0) or {}
             ka = self._score_for_symbol(coord_sc_attack, sym0) or {}
-            kc = self._score_for_symbol(coord_sc_clean, sym0) or {}
-            if "mu" in ra and "mu" in rc:
+            if "mu" in ra:
                 analyst_mu_attack = float(ra.get("mu"))
-                analyst_mu_clean = float(rc.get("mu"))
-            if "mu" in ka and "mu" in kc:
+            if "mu" in ka:
                 coord_mu_attack = float(ka.get("mu"))
-                coord_mu_clean = float(kc.get("mu"))
         except Exception:
             pass
 
-        bss_analyst = self._compute_bss(analyst_mu_attack, analyst_mu_clean)
-        bss_coord = self._compute_bss(coord_mu_attack, coord_mu_clean)
+        # No clean mus available here
+        analyst_mu_clean = None
+        coord_mu_clean = None
+
+        # Env-level BSS placeholders (real BSS is computed offline via metrics.py)
+        bss_analyst = 0.0
+        bss_coord = 0.0
 
         # Persist contagion/perf features for the *next* observation
         self._last_ir_k = ir_k
@@ -516,8 +477,9 @@ class RLAttackEnv:
         self._last_bss_coord = bss_coord
         self._last_pnl_delta = pnl_delta
 
-        # 5) Build info for reward wrapper (includes everything needed for IR@k + BSS)
+        # 4) Build info for reward wrapper / logging
         info: Dict[str, Any] = {
+            "date": date,
             "orders": orders_eff,
             "label": label,
             "equity": float(self._equity),
@@ -526,12 +488,12 @@ class RLAttackEnv:
             "a_trade": float(a_trade),
             "a_sent": float(a_sent),
             "lev": lev,
-            # --- perf delta support (per-step PnL) ---
+            # --- perf terms (env-level) ---
             "pnl_attack": pnl_attack,
-            "pnl_clean": pnl_clean,
+            "pnl_clean": pnl_clean,   # 0.0 inside env now
             "pnl_delta": pnl_delta,
             # --- symbols for BSS symbol disambiguation ---
-            "symbols": self.assets[:],  # reward wrapper will pick the first if needed
+            "symbols": self.assets[:],
             # --- IR@k support + logging ---
             "ingested_topk_ids": ingested_ids_attack or [],
             "ir_k": ir_k,
@@ -542,11 +504,11 @@ class RLAttackEnv:
                 {"id": x["attk_id"], "symbol": x["symbol"], "date": x["date"]}
                 for x in injected
             ],
-            # --- scorecards for BSS (analyst + coordinator) ---
+            # --- scorecards for BSS (attack only; clean is now offline) ---
             "analyst_attack_scorecard": analyst_sc_attack or [],
-            "analyst_clean_scorecard": analyst_sc_clean or [],
+            "analyst_clean_scorecard": [],  # kept for backward-compat; empty
             "coordinator_attack_scorecard": coord_sc_attack or [],
-            "coordinator_clean_scorecard": coord_sc_clean or [],
+            "coordinator_clean_scorecard": [],  # kept for backward-compat; empty
             # --- convenience mus (if available) ---
             "analyst_mu_attack": analyst_mu_attack,
             "analyst_mu_clean": analyst_mu_clean,
@@ -556,7 +518,7 @@ class RLAttackEnv:
 
         self._prev_orders = orders_eff[-10:]
 
-        # 6) Advance day
+        # 5) Advance day
         self._t += 1
         done = self._t >= len(self.dates)
         r_attack = float(pnl_attack)  # raw env reward = attacked per-step PnL
@@ -564,6 +526,6 @@ class RLAttackEnv:
         if done:
             return {}, r_attack, True, info
 
-        # 7) Next observation
+        # 6) Next observation
         obs_next = self._observe()
         return obs_next, r_attack, False, info

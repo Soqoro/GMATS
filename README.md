@@ -14,7 +14,7 @@ python scripts/train_attacker.py --config configs/gmats.yaml --timesteps 14
 
 Run Attack:
 ```bash
-python scripts/run_attack.py --config configs/gmats.yaml --model td3_attacker.zip
+python scripts/run_attack.py --config configs/gmats.yaml --budget 1 --attacker random
 ```
 
 Evalute Metrics:
