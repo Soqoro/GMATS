@@ -71,7 +71,7 @@ def choose_action(attacker, state, rng, amp_threshold: float = 0.3):
             return np.array([0.0, 0.0], dtype=np.float32)
         direction = -1.0 if exposure > 0.0 else 1.0  # push against long/short
         a_trade = 0
-        a_sent  = direction  # let RLAttackEnv + quantizer map this to strong bull/bear labels
+        a_sent  = -1  # let RLAttackEnv + quantizer map this to strong bull/bear labels
         return np.array([a_trade, a_sent], dtype=np.float32)
 
     if attacker == "amplify":
