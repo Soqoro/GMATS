@@ -47,16 +47,16 @@ Kaggle terms of use), then manually process it into the same format as the
 example Twitter files in data/ (e.g., one row per tweet with the expected
 columns).
 
-Commands:
+## Commands
 
-Run clean baseline:
+### Run clean baseline
 python scripts/run.py --config configs/gmats.yaml --debug --log_by_asset --log_agents
 
-Train RL agent:
+### Train RL agent:
 python scripts/train_attacker.py --config configs/gmats.yaml --timesteps 14
 
-Run Attack:
+### Run Attack:
 python scripts/run_attack.py --config configs/gmats.yaml --budget 1 --attacker random
 
-Evalute Metrics:
+### Evalute Metrics:
 python scripts/metrics.py   --attack_logs results/attack/logs   --clean_logs  results/baseline/logs   --poison_ids  results/attack/poison_ids.jsonl --attack_results_csv results/attack/results/attack_summary_by_ticker.csv --clean_results_csv results/baseline/results/gmats_local_GMATSLLMStrategy.csv
