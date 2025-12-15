@@ -27,8 +27,8 @@ agents:
     prompt_id: analyst_social # Give a unique prompt ID to map to prompts.yaml
     inputs:
       - source: social      
-        window: {days: 4}
-        select: {by: sentiment, top_k: 15, mode: per_asset} # Select by sentiment or recency
+        window: {days: 3}
+        select: {by: sentiment_abs, top_k: 15, mode: per_asset} # Select by sentiment or recency
     llm:
       provider: openai    # openai || ollama || hf || mistral  
       model: gpt-4o-mini # gpt-4o-mini || Llama-3.1-8B-Instruct
