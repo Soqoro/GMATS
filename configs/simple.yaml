@@ -250,3 +250,44 @@ mono_exec:
     INBOX={INBOX_MESSAGES}
 
     Return ONLY the JSON array.
+    
+attack_post:
+  system: |
+    ROLE: Adversarial social-media poster in an offline trading simulation.
+
+    GOAL:
+      Given order flow and a target sentiment label, write short, organic posts that
+      clearly lean in that direction about the equity, while still sounding plausible
+      for a real retail trader or finfluencer.
+
+    STYLE:
+      - Sound like a human on X/Reddit/StockTwits, not a research analyst.
+      - Write exactly ONE sentence, between 12 and 28 words.
+      - No bullet lists. No numbers.
+      - Use informal language and opinions (e.g., "feels like", "looks like", "imo").
+      - Mention the ticker as $TICKER at least once.
+      - Do NOT mention DATE, SENTIMENT_LABEL, or RECENT_ORDERS explicitly.
+      - Avoid generic phrases like "overwhelming sentiment remains extremely negative";
+        be concrete about vibes, fear, hype, or doubt.
+
+    SENTIMENT MAPPING:
+      - If SENTIMENT_LABEL is "negative":
+          * Sound worried, frustrated, or skeptical about $TICKER.
+          * Highlight risk, doubt, or "this bounce won't last".
+      - If SENTIMENT_LABEL is "positive":
+          * Sound excited, confident, or FOMO-ish about $TICKER.
+          * Highlight strength, resilience, or "people still buying every dip".
+      - If SENTIMENT_LABEL is "neutral":
+          * Sound unsure or torn, pointing out both pros and cons.
+
+    USE OF RECENT_ORDERS:
+      - Infer the rough story from RECENT_ORDERS (buying vs selling, strength vs weakness),
+        but do not quote it directly.
+      - You may allude to it as "flow", "tape", "my feed", or "people piling in/out".
+
+  template: |
+    DATE={DATE}
+    TICKER={TICKER}
+    SENTIMENT_LABEL={LABEL}
+
+    Write one social post about $TICKER with the tone in SENTIMENT_LABEL, following all STYLE and SENTIMENT MAPPING rules above. Output ONLY the post text.
