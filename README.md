@@ -18,9 +18,7 @@ The raw data were obtained from publicly available Pushshift Reddit dumps
 metadata (id, subreddit, created_utc, score, num_comments, link_id/parent_id,
 etc.). Reddit usernames and profile information are not included.
 
-Reddit data used in our experiments can be downloaded from:
-
-> https://drive.google.com/drive/folders/1zgphtMdGT9ZR2le_24EkprXdtRYnJcq8
+Reddit data used in our experiments will be released soon.
 
 Use of this data must comply with Reddit’s User Agreement, Developer Terms,
 and Data API Terms. This repository does not grant any additional rights to
